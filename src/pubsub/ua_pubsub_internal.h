@@ -386,7 +386,8 @@ UA_WriterGroup_setPubSubState(UA_PubSubManager *psm, UA_WriterGroup *wg,
                               UA_PubSubState targetState);
 
 void
-UA_WriterGroup_publishCallback(UA_PubSubManager *psm, UA_WriterGroup *wg);
+UA_WriterGroup_publishCallback(void *application /* UA_PubSubManager */,
+                               void *context /* UA_WriterGroup */);
 
 /**********************************************/
 /*               DataSetField                 */
@@ -617,7 +618,7 @@ typedef struct UA_ReserveId {
 typedef ZIP_HEAD(UA_ReserveIdTree, UA_ReserveId) UA_ReserveIdTree;
 
 struct UA_PubSubManager {
-    UA_ServerComponent sc;
+    UA_Driver drv;
 
     UA_Logger *logging; /* shortcut to sc->server.logging */
 
@@ -655,7 +656,7 @@ struct UA_PubSubManager {
 
 static UA_INLINE UA_PubSubManager *
 getPSM(UA_Server *server) {
-    return (UA_PubSubManager*)getServerComponentByName(server, UA_STRING("pubsub"));
+    return (UA_PubSubManager*)server->pubSubDriver;
 }
 
 UA_StatusCode
@@ -758,6 +759,14 @@ typeContainsString(const UA_DataType *type, size_t depth) {
 }
 
 #endif /* UA_ENABLE_PUBSUB */
+
+/* Free a partially-constructed component without re-asking the lifecycle
+ * callback. Used by create() on abort paths; the existing remove/delete
+ * defers free via deleteFlag for components with EventLoop channels. */
+void
+UA_PubSubComponent_freeWithoutLifecycleCallback(UA_PubSubManager *psm,
+                                                void *component,
+                                                UA_PubSubComponentType type);
 
 _UA_END_DECLS
 

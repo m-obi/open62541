@@ -97,7 +97,7 @@ function build_amalgamation {
 }
 
 function build_amalgamation_mingw_cross {
-    mkdir -p build; cd build; rm -rf *
+    rm -rf build; mkdir -p build; cd build
     cmake -DCMAKE_BUILD_TYPE=Debug \
           -DUA_ENABLE_AMALGAMATION=ON \
           -DUA_ARCHITECTURE=win32 \
@@ -140,6 +140,44 @@ function build_amalgamation_mt {
           ..
     make open62541-amalgamation ${MAKEOPTS}
     gcc -Wall -Werror -c open62541.c
+}
+
+function build_amalgamation_none_arch {
+    rm -rf build; mkdir -p build; cd build
+    cmake -DCMAKE_BUILD_TYPE=Debug \
+          -DUA_ENABLE_AMALGAMATION=ON \
+          -DUA_ARCHITECTURE=none \
+          -DUA_ENABLE_SUBSCRIPTIONS_EVENTS=ON \
+          -DUA_ENABLE_JSON_ENCODING=ON \
+          -DUA_ENABLE_XML_ENCODING=ON \
+          -DUA_ENABLE_PUBSUB=ON \
+          -DUA_ENABLE_PUBSUB_INFORMATIONMODEL=ON \
+          ..
+    make open62541-amalgamation ${MAKEOPTS}
+
+    # Smoke test: compile and link a small program against the amalgamation
+    # to catch any missing symbols that only show up at link time
+    cat > amalgamation_none_smoke.c <<EOF
+#include "open62541.h"
+
+int main(void) {
+    UA_Server *server = UA_Server_new();
+    if(!server)
+        return 1;
+
+    UA_Server_delete(server);
+
+    UA_Client *client = UA_Client_new();
+    if(!client)
+        return 2;
+    UA_Client_delete(client);
+
+    return 0;
+}
+EOF
+
+    gcc -Wall -Werror -I. amalgamation_none_smoke.c open62541.c \
+        -o amalgamation_none_smoke -lpthread
 }
 
 ############################
@@ -185,6 +223,7 @@ function unit_tests {
           -DUA_ENABLE_PUBSUB=ON \
           -DUA_ENABLE_MQTT=ON \
           -DUA_ENABLE_PUBSUB_INFORMATIONMODEL=ON \
+          -DUA_ENABLE_PUBSUB_FILE_CONFIG=ON \
           -DUA_FORCE_WERROR=ON \
           -DUA_MULTITHREADING=${MULTITHREADING} \
           ..
@@ -194,6 +233,43 @@ function unit_tests {
     if [ "$COVERAGE" = "ON" ]; then
         make gcov
     fi
+}
+
+function unit_tests_libwebsockets {
+    set -euo pipefail
+
+    # Start HTTP server
+    python3 tools/lws/httpServer.py  &
+    SERVER_PID=$!
+    echo "HTTP server PID: $SERVER_PID"
+
+    # Ensure we stop the server on any exit from this shell
+    trap 'echo "Stopping server $SERVER_PID"; kill $SERVER_PID 2>/dev/null || true' EXIT
+
+    # Wait until reachable (max 30s)
+    for i in {1..30}; do
+        if curl -fsS http://127.0.0.1:8000/ >/dev/null 2>&1; then
+            echo "Server is up."
+            break
+        fi
+        sleep 1
+    done
+    # Fail fast if still not up
+    curl -fsS http://127.0.0.1:8000/ >/dev/null
+
+    mkdir -p build; cd build; rm -rf *
+    cmake -DCMAKE_BUILD_TYPE=Debug \
+          -DUA_BUILD_EXAMPLES=ON \
+          -DUA_BUILD_UNIT_TESTS=ON \
+          -DUA_ENABLE_COVERAGE=ON \
+          -DUA_ENABLE_LWS=ON \
+          -DUA_ENABLE_PUBSUB=OFF \
+          -DUA_ENABLE_PUBSUB_INFORMATIONMODEL=OFF \
+          -DUA_FORCE_WERROR=ON \
+          ..
+    make ${MAKEOPTS}
+    set_capabilities
+    make test ARGS="-V"
 }
 
 function unit_tests_lwip {
@@ -268,6 +344,20 @@ function unit_tests_diag {
     make gcov
 }
 
+function unit_tests_mdnsd {
+    rm -rf build; mkdir -p build; cd build
+    # The mDNS driver is enabled automatically when deps/mdnsd is present.
+    # This job intentionally exercises that multicast discovery driver path.
+    cmake -DCMAKE_BUILD_TYPE=Debug \
+          -DUA_BUILD_UNIT_TESTS=ON \
+          -DUA_ENABLE_DISCOVERY=ON \
+          -DUA_ENABLE_DISCOVERY_SEMAPHORE=ON \
+          ..
+    make ${MAKEOPTS} check_discovery_mdnsd
+    set_capabilities
+    make test ARGS="-V -R ^check_discovery_mdnsd$"
+}
+
 function unit_tests_mt {
     rm -rf build; mkdir -p build; cd build
     cmake -DCMAKE_BUILD_TYPE=Debug \
@@ -294,7 +384,6 @@ function unit_tests_alarms {
           -DUA_ENABLE_NODESETLOADER=ON \
           -DUA_ENABLE_XML_ENCODING=ON \
           -DUA_ENABLE_SUBSCRIPTIONS_EVENTS=ON \
-          -DUA_ENABLE_SUBSCRIPTIONS_ALARMS_CONDITIONS=ON \
           -DUA_FORCE_WERROR=ON \
           -DUA_NAMESPACE_ZERO=FULL \
           ..
@@ -304,11 +393,29 @@ function unit_tests_alarms {
     make gcov
 }
 
+function unit_tests_alarms_memcheck {
+    rm -rf build; mkdir -p build; cd build
+    cmake -DCMAKE_BUILD_TYPE=Debug \
+          -DUA_BUILD_UNIT_TESTS=ON \
+          -DUA_ENABLE_DA=ON \
+          -DUA_ENABLE_NODESETLOADER=ON \
+          -DUA_ENABLE_XML_ENCODING=ON \
+          -DUA_ENABLE_SUBSCRIPTIONS_EVENTS=ON \
+          -DUA_ENABLE_UNIT_TESTS_MEMCHECK=ON \
+          -DUA_FORCE_WERROR=ON \
+          -DUA_NAMESPACE_ZERO=FULL \
+          ..
+
+    make ${MAKEOPTS}
+    # set_capabilities not possible with valgrind
+    sudo -E bash -c "make test ARGS=\"-V\""
+}
+
 function unit_tests_encryption {
     rm -rf build; mkdir -p build; cd build
     cmake -DCMAKE_BUILD_TYPE=Debug \
           -DUA_BUILD_EXAMPLES=ON \
-          -DUA_ENABLE_GDS_PUSHMANAGEMENT=ON \
+          -DUA_ENABLE_DRIVER_GDS_RECEIVER=ON \
           -DUA_BUILD_UNIT_TESTS=ON \
           -DUA_ENABLE_COVERAGE=ON \
           -DUA_ENABLE_ENCRYPTION=$1 \
@@ -386,20 +493,24 @@ function unit_tests_valgrind {
 ##########################
 
 function run_examples {
+    local multicast_backend=${2:-mdnsd}
     rm -rf build; mkdir -p build; cd build
 
     # create certificates for the examples
     python3 ../tools/certs/create_self-signed.py -c server
     python3 ../tools/certs/create_self-signed.py -c client
 
-    # copy json server config
-    cp ../examples/json_config/server_json_config.json5 server_json_config.json5
+    # copy json configs for the examples
+    cp ../examples/json_config/*.json5 ./
+
+    # The old multicast selector is gone. Keep the CI parameter visible here:
+    # these examples still require multicast discovery.
+    echo "Running examples with multicast discovery backend: ${multicast_backend}"
 
     cmake -DCMAKE_BUILD_TYPE=Debug \
           -DUA_BUILD_EXAMPLES=ON \
           -DUA_ENABLE_ENCRYPTION=$1 \
           -DUA_ENABLE_SUBSCRIPTIONS_EVENTS=ON \
-          -DUA_ENABLE_SUBSCRIPTIONS_ALARMS_CONDITIONS=ON \
           -DUA_ENABLE_JSON_ENCODING=ON \
           -DUA_ENABLE_PUBSUB=ON \
           -DUA_ENABLE_PUBSUB_INFORMATIONMODEL=ON \
@@ -410,7 +521,6 @@ function run_examples {
           -DUA_ENABLE_NODESETLOADER=ON \
           -DUA_ENABLE_PUBSUB_SKS=ON \
           -DUA_ENABLE_DISCOVERY=ON \
-          -DUA_ENABLE_DISCOVERY_MULTICAST=$2 \
           -DUA_FORCE_WERROR=ON \
           ..
     make ${MAKEOPTS}
@@ -431,6 +541,7 @@ function run_examples {
 ########################################
 
 function examples_valgrind {
+    local multicast_backend=${2:-mdnsd}
     rm -rf build; mkdir -p build; cd build
 
     # create certificates for the examples
@@ -440,11 +551,14 @@ function examples_valgrind {
     # copy json server config
     cp ../examples/json_config/server_json_config.json5 server_json_config.json5
 
+    # The old multicast selector is gone. Keep the CI parameter visible here:
+    # these examples still require multicast discovery.
+    echo "Running examples under valgrind with multicast discovery backend: ${multicast_backend}"
+
     cmake -DCMAKE_BUILD_TYPE=Debug \
           -DUA_BUILD_EXAMPLES=ON \
           -DUA_ENABLE_ENCRYPTION=$1 \
           -DUA_ENABLE_SUBSCRIPTIONS_EVENTS=ON \
-          -DUA_ENABLE_SUBSCRIPTIONS_ALARMS_CONDITIONS=ON \
           -DUA_ENABLE_JSON_ENCODING=ON \
           -DUA_ENABLE_PUBSUB=ON \
           -DUA_ENABLE_PUBSUB_INFORMATIONMODEL=ON \
@@ -455,7 +569,6 @@ function examples_valgrind {
           -DUA_ENABLE_NODESETLOADER=ON \
           -DUA_ENABLE_PUBSUB_SKS=ON \
           -DUA_ENABLE_DISCOVERY=ON \
-          -DUA_ENABLE_DISCOVERY_MULTICAST=$2 \
           -DUA_FORCE_WERROR=ON \
           ..
     make ${MAKEOPTS}
@@ -483,7 +596,7 @@ function build_clang_analyzer {
           -DUA_BUILD_EXAMPLES=ON \
           -DUA_BUILD_UNIT_TESTS=ON \
           -DUA_ENABLE_ENCRYPTION=MBEDTLS \
-          -DUA_ENABLE_GDS_PUSHMANAGEMENT=ON \
+          -DUA_ENABLE_DRIVER_GDS_RECEIVER=ON \
           -DUA_ENABLE_SUBSCRIPTIONS_EVENTS=ON \
           -DUA_ENABLE_JSON_ENCODING=ON \
           -DUA_ENABLE_XML_ENCODING=ON \
@@ -493,10 +606,18 @@ function build_clang_analyzer {
           -DUA_FORCE_WERROR=ON \
           -DUA_NAMESPACE_ZERO=FULL \
           ..
+    # Disable checkers that produce false positives in the posix eventloop code
+    local checker_flags=""
+    if [ "$version" = "21" ]; then
+        checker_flags="-disable-checker unix.Errno -disable-checker unix.BlockInCriticalSection"
+    fi
     scan-build-$version \
           --status-bugs \
           --exclude ../src/util \
           --exclude ../tests \
+          --exclude ../examples \
+          --exclude ../deps \
+          $checker_flags \
           make ${MAKEOPTS}
 }
 

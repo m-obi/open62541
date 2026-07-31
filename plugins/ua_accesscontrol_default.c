@@ -8,6 +8,15 @@
 
 #include <open62541/plugin/accesscontrol_default.h>
 
+#ifdef UA_ENABLE_RBAC
+/* Internal RBAC API; not declared in public plugin headers. */
+UA_StatusCode
+UA_Server_getEffectivePermissions(UA_Server *server,
+                                  const UA_NodeId *sessionId,
+                                  const UA_NodeId *nodeId,
+                                  UA_PermissionType *effectivePermissions);
+#endif
+
 /* Example access control management. Anonymous and username / password login.
  * The access rights are maximally permissive.
  *
@@ -64,6 +73,15 @@ activateSession_default(UA_Server *server, UA_AccessControl *ac,
         /* Anonymous login */
         if(!context->allowAnonymous)
             return UA_STATUSCODE_BADIDENTITYTOKENINVALID;
+        if(context->loginCallback) {
+            UA_StatusCode res =
+                context->loginCallback(&UA_STRING_NULL, &UA_BYTESTRING_NULL,
+                                       context->usernamePasswordLoginSize,
+                                       context->usernamePasswordLogin,
+                                       sessionContext, context->loginContext);
+            if(res != UA_STATUSCODE_GOOD)
+                return UA_STATUSCODE_BADUSERACCESSDENIED;
+        }
     } else if(tokenType == &UA_TYPES[UA_TYPES_USERNAMEIDENTITYTOKEN]) {
         /* Username and password */
         const UA_UserNameIdentityToken *userToken = (UA_UserNameIdentityToken*)
@@ -110,6 +128,18 @@ activateSession_default(UA_Server *server, UA_AccessControl *ac,
         return UA_STATUSCODE_BADIDENTITYTOKENINVALID;
     }
 
+    /* Store the endpoint's SecurityPolicyUri as a custom session attribute.
+     * This is needed later in allowTransferSubscription_default to determine
+     * whether the session was established over a secure channel. */
+    if(endpointDescription) {
+        UA_Variant spUri;
+        UA_Variant_setScalar(&spUri, (void*)(uintptr_t)&endpointDescription->securityPolicyUri,
+                             &UA_TYPES[UA_TYPES_STRING]);
+        UA_Server_setSessionAttribute(server, sessionId,
+                                      UA_QUALIFIEDNAME(0, "channelSecurityPolicyUri"),
+                                      &spUri);
+    }
+
     return UA_STATUSCODE_GOOD;
 }
 
@@ -118,68 +148,217 @@ closeSession_default(UA_Server *server, UA_AccessControl *ac,
                      const UA_NodeId *sessionId, void *sessionContext) {
 }
 
+/* Map RBAC PermissionType bits to the node's UserWriteMask.
+ *
+ * OPC UA Part 3, Table 8 defines three separate permission bits that
+ * control attribute writing:
+ *   - WriteAttribute  -> all WriteMask bits EXCEPT RolePermissions
+ *                        and Historizing (the "catch-all" permission)
+ *   - WriteRolePermissions -> UA_WRITEMASK_ROLEPERMISSIONS (bit 23)
+ *   - WriteHistorizing     -> UA_WRITEMASK_HISTORIZING    (bit 9)
+ *
+ * 0xFFFFFFFF effectivePerms means "no RBAC restrictions configured" for
+ * the node, so we return all-bits-set (fully permissive). */
 static UA_UInt32
 getUserRightsMask_default(UA_Server *server, UA_AccessControl *ac,
                           const UA_NodeId *sessionId, void *sessionContext,
                           const UA_NodeId *nodeId, void *nodeContext) {
+#ifdef UA_ENABLE_RBAC
+    UA_PermissionType effectivePerms = 0;
+    UA_StatusCode res = UA_Server_getEffectivePermissions(server, sessionId,
+                                                          nodeId, &effectivePerms);
+    if(res != UA_STATUSCODE_GOOD || effectivePerms == 0xFFFFFFFF)
+        return 0xFFFFFFFF;
+    UA_UInt32 userWriteMask = 0;
+    if(effectivePerms & UA_PERMISSIONTYPE_WRITEATTRIBUTE) {
+        /* Grant all attribute-write bits, then carve out the two that
+         * have their own dedicated permission bits. */
+        userWriteMask = 0xFFFFFFFF;
+        userWriteMask &= ~UA_WRITEMASK_ROLEPERMISSIONS;
+        userWriteMask &= ~UA_WRITEMASK_HISTORIZING;
+    }
+    if(effectivePerms & UA_PERMISSIONTYPE_WRITEROLEPERMISSIONS)
+        userWriteMask |= UA_WRITEMASK_ROLEPERMISSIONS;
+    if(effectivePerms & UA_PERMISSIONTYPE_WRITEHISTORIZING)
+        userWriteMask |= UA_WRITEMASK_HISTORIZING;
+    return userWriteMask;
+#else
     return 0xFFFFFFFF;
+#endif
 }
 
+/* Map RBAC PermissionType bits to the Variable node's UserAccessLevel.
+ *
+ * OPC UA Part 3, Table 8 maps:
+ *   - Read          -> ACCESSLEVELMASK_READ         (bit 0)
+ *   - Write         -> ACCESSLEVELMASK_WRITE        (bit 1)
+ *   - ReadHistory   -> ACCESSLEVELMASK_HISTORYREAD  (bit 2)
+ *   - InsertHistory |
+ *     ModifyHistory |
+ *     DeleteHistory -> ACCESSLEVELMASK_HISTORYWRITE (bit 3)
+ *
+ * StatusWrite (bit 5) and TimestampWrite (bit 6) are not mapped from
+ * RBAC permissions — they remain restricted unless the node has no
+ * RBAC configuration (0xFFFFFFFF). */
 static UA_Byte
 getUserAccessLevel_default(UA_Server *server, UA_AccessControl *ac,
                            const UA_NodeId *sessionId, void *sessionContext,
                            const UA_NodeId *nodeId, void *nodeContext) {
+#ifdef UA_ENABLE_RBAC
+    UA_PermissionType effectivePerms = 0;
+    UA_StatusCode res = UA_Server_getEffectivePermissions(server, sessionId,
+                                                          nodeId, &effectivePerms);
+    if(res != UA_STATUSCODE_GOOD || effectivePerms == 0xFFFFFFFF)
+        return 0xFF;
+    UA_Byte userAccessLevel = 0;
+    if(effectivePerms & UA_PERMISSIONTYPE_READ)
+        userAccessLevel |= UA_ACCESSLEVELMASK_READ;
+    if(effectivePerms & UA_PERMISSIONTYPE_WRITE)
+        userAccessLevel |= UA_ACCESSLEVELMASK_WRITE;
+    if(effectivePerms & UA_PERMISSIONTYPE_READHISTORY)
+        userAccessLevel |= UA_ACCESSLEVELMASK_HISTORYREAD;
+    if(effectivePerms & (UA_PERMISSIONTYPE_INSERTHISTORY |
+                         UA_PERMISSIONTYPE_MODIFYHISTORY |
+                         UA_PERMISSIONTYPE_DELETEHISTORY))
+        userAccessLevel |= UA_ACCESSLEVELMASK_HISTORYWRITE;
+    return userAccessLevel;
+#else
     return 0xFF;
+#endif
 }
 
+/* OPC UA Part 3, Table 8: Call permission -> UserExecutable attribute. */
 static UA_Boolean
 getUserExecutable_default(UA_Server *server, UA_AccessControl *ac,
                           const UA_NodeId *sessionId, void *sessionContext,
                           const UA_NodeId *methodId, void *methodContext) {
+#ifdef UA_ENABLE_RBAC
+    UA_PermissionType effectivePerms = 0;
+    UA_StatusCode res = UA_Server_getEffectivePermissions(server, sessionId,
+                                                          methodId, &effectivePerms);
+    if(res != UA_STATUSCODE_GOOD || effectivePerms == 0xFFFFFFFF)
+        return true;
+    return (effectivePerms & UA_PERMISSIONTYPE_CALL) != 0;
+#else
     return true;
+#endif
 }
 
+/* Call permission is checked on both the object and the method node.
+ * Both must grant CALL for the method invocation to be allowed. */
 static UA_Boolean
 getUserExecutableOnObject_default(UA_Server *server, UA_AccessControl *ac,
                                   const UA_NodeId *sessionId, void *sessionContext,
                                   const UA_NodeId *methodId, void *methodContext,
                                   const UA_NodeId *objectId, void *objectContext) {
+#ifdef UA_ENABLE_RBAC
+    UA_PermissionType objectPerms = 0;
+    UA_StatusCode res = UA_Server_getEffectivePermissions(server, sessionId,
+                                                          objectId, &objectPerms);
+    if(res != UA_STATUSCODE_GOOD)
+        return true;
+    if(objectPerms != 0xFFFFFFFF && !(objectPerms & UA_PERMISSIONTYPE_CALL))
+        return false;
+    UA_PermissionType methodPerms = 0;
+    res = UA_Server_getEffectivePermissions(server, sessionId,
+                                            methodId, &methodPerms);
+    if(res != UA_STATUSCODE_GOOD)
+        return true;
+    if(methodPerms != 0xFFFFFFFF && !(methodPerms & UA_PERMISSIONTYPE_CALL))
+        return false;
     return true;
+#else
+    return true;
+#endif
 }
 
+/* AddNode permission is checked on the parent node. */
 static UA_Boolean
 allowAddNode_default(UA_Server *server, UA_AccessControl *ac,
                      const UA_NodeId *sessionId, void *sessionContext,
                      const UA_AddNodesItem *item) {
+#ifdef UA_ENABLE_RBAC
+    UA_PermissionType effectivePerms = 0;
+    UA_StatusCode res = UA_Server_getEffectivePermissions(server, sessionId,
+                                                          &item->parentNodeId.nodeId,
+                                                          &effectivePerms);
+    if(res != UA_STATUSCODE_GOOD || effectivePerms == 0xFFFFFFFF)
+        return true;
+    return (effectivePerms & UA_PERMISSIONTYPE_ADDNODE) != 0;
+#else
     return true;
+#endif
 }
 
+/* AddReference permission is checked on the source node. */
 static UA_Boolean
 allowAddReference_default(UA_Server *server, UA_AccessControl *ac,
                           const UA_NodeId *sessionId, void *sessionContext,
                           const UA_AddReferencesItem *item) {
+#ifdef UA_ENABLE_RBAC
+    UA_PermissionType effectivePerms = 0;
+    UA_StatusCode res = UA_Server_getEffectivePermissions(server, sessionId,
+                                                          &item->sourceNodeId,
+                                                          &effectivePerms);
+    if(res != UA_STATUSCODE_GOOD || effectivePerms == 0xFFFFFFFF)
+        return true;
+    return (effectivePerms & UA_PERMISSIONTYPE_ADDREFERENCE) != 0;
+#else
     return true;
+#endif
 }
 
+/* DeleteNode permission is checked on the node itself. */
 static UA_Boolean
 allowDeleteNode_default(UA_Server *server, UA_AccessControl *ac,
                         const UA_NodeId *sessionId, void *sessionContext,
                         const UA_DeleteNodesItem *item) {
+#ifdef UA_ENABLE_RBAC
+    UA_PermissionType effectivePerms = 0;
+    UA_StatusCode res = UA_Server_getEffectivePermissions(server, sessionId,
+                                                          &item->nodeId,
+                                                          &effectivePerms);
+    if(res != UA_STATUSCODE_GOOD || effectivePerms == 0xFFFFFFFF)
+        return true;
+    return (effectivePerms & UA_PERMISSIONTYPE_DELETENODE) != 0;
+#else
     return true;
+#endif
 }
 
+/* RemoveReference permission is checked on the source node. */
 static UA_Boolean
 allowDeleteReference_default(UA_Server *server, UA_AccessControl *ac,
                              const UA_NodeId *sessionId, void *sessionContext,
                              const UA_DeleteReferencesItem *item) {
+#ifdef UA_ENABLE_RBAC
+    UA_PermissionType effectivePerms = 0;
+    UA_StatusCode res = UA_Server_getEffectivePermissions(server, sessionId,
+                                                          &item->sourceNodeId,
+                                                          &effectivePerms);
+    if(res != UA_STATUSCODE_GOOD || effectivePerms == 0xFFFFFFFF)
+        return true;
+    return (effectivePerms & UA_PERMISSIONTYPE_REMOVEREFERENCE) != 0;
+#else
     return true;
+#endif
 }
 
+/* OPC UA Part 3, Table 8: Browse permission. */
 static UA_Boolean
 allowBrowseNode_default(UA_Server *server, UA_AccessControl *ac,
                         const UA_NodeId *sessionId, void *sessionContext,
                         const UA_NodeId *nodeId, void *nodeContext) {
+#ifdef UA_ENABLE_RBAC
+    UA_PermissionType effectivePerms = 0;
+    UA_StatusCode res = UA_Server_getEffectivePermissions(server, sessionId,
+                                                          nodeId, &effectivePerms);
+    if(res != UA_STATUSCODE_GOOD || effectivePerms == 0xFFFFFFFF)
+        return true;
+    return (effectivePerms & UA_PERMISSIONTYPE_BROWSE) != 0;
+#else
     return true;
+#endif
 }
 
 #ifdef UA_ENABLE_SUBSCRIPTIONS
@@ -194,7 +373,7 @@ allowTransferSubscription_default(UA_Server *server, UA_AccessControl *ac,
                                   const UA_NodeId *oldSessionId, void *oldSessionContext,
                                   const UA_NodeId *newSessionId, void *newSessionContext) {
     if(!oldSessionId)
-        return true;
+        return false;
     
     /* Get clientUserId for both sessions */
     UA_Variant session1UserId;
@@ -215,11 +394,80 @@ allowTransferSubscription_default(UA_Server *server, UA_AccessControl *ac,
         UA_String *userId1 = (UA_String*)session1UserId.data;
         UA_String *userId2 = (UA_String*)session2UserId.data;
         
-        /* Anonymous users have empty userId - reject immediately.
-         * According to OPC UA CTT, anonymous users should not be
-         * allowed to transfer subscriptions. */
-        if(userId1->length == 0 || userId2->length == 0) {
-            result = false;
+        if(userId1->length == 0 && userId2->length == 0) {
+            /* Both users are anonymous.
+             * For anonymous users, the OPC UA specification requires
+             * checking the ApplicationUri from the clientDescription
+             * to verify that the same application is transferring the
+             * subscription (e.g. after a network interruption or client
+             * crash with reconnect on a different SecureChannel).
+             *
+             * Additionally, on unsecure connections (SecurityPolicy#None)
+             * the ApplicationUri is not verified against a certificate,
+             * so the transfer must be rejected. */
+
+            /* First check: Both sessions must use a secure channel
+             * (not SecurityPolicy#None). The securityPolicyUri was
+             * stored as a session attribute during ActivateSession. */
+            UA_Variant session1SpUri;
+            UA_Variant_init(&session1SpUri);
+            UA_Server_getSessionAttribute(server, oldSessionId,
+                                          UA_QUALIFIEDNAME(0, "channelSecurityPolicyUri"),
+                                          &session1SpUri);
+            UA_Variant session2SpUri;
+            UA_Variant_init(&session2SpUri);
+            UA_Server_getSessionAttribute(server, newSessionId,
+                                          UA_QUALIFIEDNAME(0, "channelSecurityPolicyUri"),
+                                          &session2SpUri);
+
+            UA_Boolean bothSecure = false;
+            if(session1SpUri.type == &UA_TYPES[UA_TYPES_STRING] &&
+               session2SpUri.type == &UA_TYPES[UA_TYPES_STRING]) {
+                UA_String *spUri1 = (UA_String*)session1SpUri.data;
+                UA_String *spUri2 = (UA_String*)session2SpUri.data;
+                /* Reject if either session uses SecurityPolicy#None */
+                if(!UA_String_equal(spUri1, &UA_SECURITY_POLICY_NONE_URI) &&
+                   !UA_String_equal(spUri2, &UA_SECURITY_POLICY_NONE_URI)) {
+                    bothSecure = true;
+                }
+            }
+
+            UA_Variant_clear(&session1SpUri);
+            UA_Variant_clear(&session2SpUri);
+
+            /* Second check: If both channels are secure, compare the
+             * ApplicationUri from the clientDescription. On secure
+             * connections the ApplicationUri is validated against
+             * the client certificate during CreateSession. */
+            if(bothSecure) {
+                UA_Variant session1Desc;
+                UA_Variant_init(&session1Desc);
+                UA_Server_getSessionAttribute(server, oldSessionId,
+                                              UA_QUALIFIEDNAME(0, "clientDescription"),
+                                              &session1Desc);
+                UA_Variant session2Desc;
+                UA_Variant_init(&session2Desc);
+                UA_Server_getSessionAttribute(server, newSessionId,
+                                              UA_QUALIFIEDNAME(0, "clientDescription"),
+                                              &session2Desc);
+
+                if(session1Desc.type == &UA_TYPES[UA_TYPES_APPLICATIONDESCRIPTION] &&
+                   session2Desc.type == &UA_TYPES[UA_TYPES_APPLICATIONDESCRIPTION]) {
+                    UA_ApplicationDescription *desc1 =
+                        (UA_ApplicationDescription*)session1Desc.data;
+                    UA_ApplicationDescription *desc2 =
+                        (UA_ApplicationDescription*)session2Desc.data;
+                    if(desc1->applicationUri.length > 0 &&
+                       desc2->applicationUri.length > 0 &&
+                       UA_String_equal(&desc1->applicationUri,
+                                       &desc2->applicationUri)) {
+                        result = true;
+                    }
+                }
+
+                UA_Variant_clear(&session1Desc);
+                UA_Variant_clear(&session2Desc);
+            }
         } else if(UA_String_equal(userId1, userId2)) {
             /* Same authenticated user - allow transfer */
             result = true;
@@ -234,15 +482,32 @@ allowTransferSubscription_default(UA_Server *server, UA_AccessControl *ac,
 #endif
 
 #ifdef UA_ENABLE_HISTORIZING
+/* OPC UA Part 3, Table 8: InsertHistory / ModifyHistory permissions.
+ * INSERT -> InsertHistory, REPLACE/UPDATE -> ModifyHistory. */
 static UA_Boolean
 allowHistoryUpdateUpdateData_default(UA_Server *server, UA_AccessControl *ac,
                                      const UA_NodeId *sessionId, void *sessionContext,
                                      const UA_NodeId *nodeId,
                                      UA_PerformUpdateType performInsertReplace,
                                      const UA_DataValue *value) {
+#ifdef UA_ENABLE_RBAC
+    UA_PermissionType effectivePerms = 0;
+    UA_StatusCode res = UA_Server_getEffectivePermissions(server, sessionId,
+                                                          nodeId, &effectivePerms);
+    if(res != UA_STATUSCODE_GOOD || effectivePerms == 0xFFFFFFFF)
+        return true;
+    if(performInsertReplace == UA_PERFORMUPDATETYPE_INSERT)
+        return (effectivePerms & UA_PERMISSIONTYPE_INSERTHISTORY) != 0;
+    else if(performInsertReplace == UA_PERFORMUPDATETYPE_REPLACE ||
+            performInsertReplace == UA_PERFORMUPDATETYPE_UPDATE)
+        return (effectivePerms & UA_PERMISSIONTYPE_MODIFYHISTORY) != 0;
     return true;
+#else
+    return true;
+#endif
 }
 
+/* OPC UA Part 3, Table 8: DeleteHistory permission. */
 static UA_Boolean
 allowHistoryUpdateDeleteRawModified_default(UA_Server *server, UA_AccessControl *ac,
                                             const UA_NodeId *sessionId, void *sessionContext,
@@ -250,7 +515,16 @@ allowHistoryUpdateDeleteRawModified_default(UA_Server *server, UA_AccessControl 
                                             UA_DateTime startTimestamp,
                                             UA_DateTime endTimestamp,
                                             bool isDeleteModified) {
+#ifdef UA_ENABLE_RBAC
+    UA_PermissionType effectivePerms = 0;
+    UA_StatusCode res = UA_Server_getEffectivePermissions(server, sessionId,
+                                                          nodeId, &effectivePerms);
+    if(res != UA_STATUSCODE_GOOD || effectivePerms == 0xFFFFFFFF)
+        return true;
+    return (effectivePerms & UA_PERMISSIONTYPE_DELETEHISTORY) != 0;
+#else
     return true;
+#endif
 }
 #endif
 

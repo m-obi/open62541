@@ -688,18 +688,6 @@ UA_Guid_random(void) {
     return result;
 }
 
-/********************/
-/* Malloc Singleton */
-/********************/
-
-#ifdef UA_ENABLE_MALLOC_SINGLETON
-# include <stdlib.h>
-UA_EXPORT UA_THREAD_LOCAL void * (*UA_mallocSingleton)(size_t size) = malloc;
-UA_EXPORT UA_THREAD_LOCAL void (*UA_freeSingleton)(void *ptr) = free;
-UA_EXPORT UA_THREAD_LOCAL void * (*UA_callocSingleton)(size_t nelem, size_t elsize) = calloc;
-UA_EXPORT UA_THREAD_LOCAL void * (*UA_reallocSingleton)(void *ptr, size_t size) = realloc;
-#endif
-
 /************************/
 /* ReferenceType Lookup */
 /************************/
@@ -1068,6 +1056,8 @@ UA_RelativePath_print(const UA_RelativePath *rp, UA_String *out) {
 
 static UA_NodeId baseEventTypeId = {0, UA_NODEIDTYPE_NUMERIC, {UA_NS0ID_BASEEVENTTYPE}};
 
+#ifdef UA_TYPES_SIMPLEATTRIBUTEOPERAND
+
 UA_StatusCode
 UA_SimpleAttributeOperand_print(const UA_SimpleAttributeOperand *sao, UA_String *out) {
     UA_RelativePathElement rpe;
@@ -1120,6 +1110,10 @@ UA_SimpleAttributeOperand_print(const UA_SimpleAttributeOperand *sao, UA_String 
     return moveTmpToOut(&tmp, out);
 }
 
+#endif /* UA_TYPES_SIMPLEATTRIBUTEOPERAND */
+
+#ifdef UA_TYPES_ATTRIBUTEOPERAND
+
 UA_StatusCode
 UA_AttributeOperand_print(const UA_AttributeOperand *ao,
                           UA_String *out) {
@@ -1165,6 +1159,8 @@ UA_AttributeOperand_print(const UA_AttributeOperand *ao,
     return moveTmpToOut(&tmp, out);
 }
 
+#endif /* UA_TYPES_ATTRIBUTEOPERAND */
+
 UA_StatusCode
 UA_ReadValueId_print(const UA_ReadValueId *rvi, UA_String *out) {
     UA_String tmp = UA_STRING_NULL;
@@ -1200,6 +1196,17 @@ UA_ReadValueId_print(const UA_ReadValueId *rvi, UA_String *out) {
     }
 
     return moveTmpToOut(&tmp, out);
+}
+
+UA_StatusCode
+UA_replace(void *orig, const void *val, const UA_DataType *type) {
+    UA_STACKARRAY(char, tmp, type->memSize);
+    UA_StatusCode res = UA_copy(val, tmp, type);
+    if(res != UA_STATUSCODE_GOOD)
+        return res;
+    UA_clear(orig, type);
+    memcpy(orig, tmp, type->memSize);
+    return UA_STATUSCODE_GOOD;
 }
 
 /************************/
@@ -1267,25 +1274,25 @@ UA_TrustListDataType_contains(const UA_TrustListDataType *trustList,
     if(!trustList || !certificate)
         return false;
 
-    if(specifiedList == UA_TRUSTLISTMASKS_TRUSTEDCERTIFICATES) {
+    if(specifiedList & UA_TRUSTLISTMASKS_TRUSTEDCERTIFICATES) {
         for(size_t i = 0; i < trustList->trustedCertificatesSize; i++) {
             if(UA_ByteString_equal(certificate, &trustList->trustedCertificates[i]))
                 return true;
         }
     }
-    if(specifiedList == UA_TRUSTLISTMASKS_TRUSTEDCRLS) {
+    if(specifiedList & UA_TRUSTLISTMASKS_TRUSTEDCRLS) {
         for(size_t i = 0; i < trustList->trustedCrlsSize; i++) {
             if(UA_ByteString_equal(certificate, &trustList->trustedCrls[i]))
                 return true;
         }
     }
-    if(specifiedList == UA_TRUSTLISTMASKS_ISSUERCERTIFICATES) {
+    if(specifiedList & UA_TRUSTLISTMASKS_ISSUERCERTIFICATES) {
         for(size_t i = 0; i < trustList->issuerCertificatesSize; i++) {
             if(UA_ByteString_equal(certificate, &trustList->issuerCertificates[i]))
                 return true;
         }
     }
-    if(specifiedList == UA_TRUSTLISTMASKS_ISSUERCRLS) {
+    if(specifiedList & UA_TRUSTLISTMASKS_ISSUERCRLS) {
         for(size_t i = 0; i < trustList->issuerCrlsSize; i++) {
             if(UA_ByteString_equal(certificate, &trustList->issuerCrls[i]))
                 return true;

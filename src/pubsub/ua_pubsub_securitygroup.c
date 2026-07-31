@@ -99,7 +99,10 @@ generateKeyData(UA_PubSubSecurityPolicy *policy, UA_ByteString *key) {
 }
 
 static void
-updateSKSKeyStorage(UA_PubSubManager *psm, UA_SecurityGroup *sg) {
+updateSKSKeyStorage(void *application /* UA_PubSubManager */,
+                    void *context /* UA_SecurityGroup */) {
+    UA_PubSubManager *psm = (UA_PubSubManager*)application;
+    UA_SecurityGroup *sg = (UA_SecurityGroup*)context;
     if(!sg) {
         UA_LOG_WARNING(psm->logging, UA_LOGCATEGORY_PUBSUB,
                        "UpdateSKSKeyStorage callback failed with Error: %s ",
@@ -154,7 +157,7 @@ updateSKSKeyStorage(UA_PubSubManager *psm, UA_SecurityGroup *sg) {
     if(nextCurrentItem)
         keyStorage->currentItem = nextCurrentItem;
 
-    UA_EventLoop *el = psm->sc.server->config.eventLoop;
+    UA_EventLoop *el = psm->drv.server->config.eventLoop;
     el->modifyTimer(el, sg->callbackId, sg->config.keyLifeTime,
                     NULL, UA_TIMERPOLICY_CURRENTTIME);
 
@@ -164,7 +167,7 @@ updateSKSKeyStorage(UA_PubSubManager *psm, UA_SecurityGroup *sg) {
 
 static UA_StatusCode
 initializeKeyStorageWithKeys(UA_PubSubManager *psm, UA_SecurityGroup *sg) {
-    UA_LOCK_ASSERT(&psm->sc.server->serviceMutex);
+    UA_LOCK_ASSERT(&psm->drv.server->serviceMutex);
 
     UA_PubSubSecurityPolicy *policy =
         findPubSubSecurityPolicy(psm, &sg->config.securityPolicyUri);
@@ -210,8 +213,8 @@ initializeKeyStorageWithKeys(UA_PubSubManager *psm, UA_SecurityGroup *sg) {
     if(retval != UA_STATUSCODE_GOOD)
         goto cleanup;
 
-    UA_EventLoop *el = psm->sc.server->config.eventLoop;
-    retval = el->addTimer(el, (UA_Callback)updateSKSKeyStorage, psm,
+    UA_EventLoop *el = psm->drv.server->config.eventLoop;
+    retval = el->addTimer(el, updateSKSKeyStorage, psm,
                           sg, sg->config.keyLifeTime, NULL,
                           UA_TIMERPOLICY_CURRENTTIME, &sg->callbackId);
 
@@ -281,7 +284,7 @@ addSecurityGroup(UA_PubSubManager *psm, UA_NodeId securityGroupFolderNodeId,
     }
 
 #ifdef UA_ENABLE_PUBSUB_INFORMATIONMODEL
-    retval = addSecurityGroupRepresentation(psm->sc.server, newSecurityGroup);
+    retval = addSecurityGroupRepresentation(psm->drv.server, newSecurityGroup);
     if(retval != UA_STATUSCODE_GOOD) {
         UA_LOG_ERROR(psm->logging, UA_LOGCATEGORY_SERVER,
                      "Add SecurityGroup failed with error: %s.",
@@ -318,14 +321,14 @@ UA_Server_addSecurityGroup(UA_Server *server, UA_NodeId securityGroupFolderNodeI
 void
 UA_SecurityGroup_remove(UA_PubSubManager *psm, UA_SecurityGroup *sg) {
 #ifdef UA_ENABLE_PUBSUB_INFORMATIONMODEL
-    deleteNode(psm->sc.server, sg->securityGroupNodeId, true);
+    deleteNode(psm->drv.server, sg->securityGroupNodeId, true);
 #endif
 
     /* Unlink from the server */
     TAILQ_REMOVE(&psm->securityGroups, sg, listEntry);
     psm->securityGroupsSize--;
     if(sg->callbackId > 0)
-        removeCallback(psm->sc.server, sg->callbackId);
+        removeCallback(psm->drv.server, sg->callbackId);
 
     if(sg->keyStorage) {
         UA_PubSubKeyStorage_detachKeyStorage(psm, sg->keyStorage);

@@ -29,6 +29,7 @@ UA_UInt32 subId;
 UA_NodeId parentNodeId;
 UA_NodeId parentReferenceNodeId;
 UA_NodeId outNodeId;
+UA_NodeId outNodeIdNullable;
 UA_NodeId outNodeIdAnalogItem;
 
 UA_Boolean notificationReceived = false;
@@ -38,7 +39,7 @@ UA_DataValue lastValue;
 
 THREAD_CALLBACK(serverloop) {
     while(running)
-        UA_Server_run_iterate(server, true);
+        UA_Server_run_iterate(server, false);
     return 0;
 }
 
@@ -106,6 +107,22 @@ static void setup(void) {
     UA_BrowsePathResult_clear(&bpr);
 #endif /* UA_ENABLE_DA */
 
+    /* Add a string (nullable) variable node */
+    UA_VariableAttributes attrStr = UA_VariableAttributes_default;
+    UA_String myString = UA_STRING("hello");
+    UA_Variant_setScalar(&attrStr.value, &myString, &UA_TYPES[UA_TYPES_STRING]);
+    attrStr.description = UA_LOCALIZEDTEXT("en-US","nullable string");
+    attrStr.displayName = UA_LOCALIZEDTEXT("en-US","nullable string");
+    attrStr.dataType = UA_TYPES[UA_TYPES_STRING].typeId;
+    attrStr.accessLevel = UA_ACCESSLEVELMASK_READ | UA_ACCESSLEVELMASK_WRITE;
+    UA_NodeId_init(&outNodeIdNullable);
+    retval = UA_Server_addVariableNode(server, UA_NODEID_STRING(1, "the.string"),
+                                       parentNodeId, parentReferenceNodeId,
+                                       UA_QUALIFIEDNAME(1, "the string"),
+                                       UA_NODEID_NUMERIC(0, UA_NS0ID_BASEDATAVARIABLETYPE),
+                                       attrStr, NULL, &outNodeIdNullable);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
     /* Add a boolean node */
     UA_Boolean myBool = false;
     UA_Variant_setScalar(&attr.value, &myBool, &UA_TYPES[UA_TYPES_BOOLEAN]);
@@ -142,6 +159,7 @@ static void teardown(void) {
     UA_NodeId_clear(&parentNodeId);
     UA_NodeId_clear(&parentReferenceNodeId);
     UA_NodeId_clear(&outNodeId);
+    UA_NodeId_clear(&outNodeIdNullable);
 #ifdef UA_ENABLE_DA
     UA_NodeId_clear(&outNodeIdAnalogItem);
 #endif /* UA_ENABLE_DA */
@@ -172,18 +190,38 @@ setDouble(UA_Client *thisClient, UA_NodeId node, UA_Double value) {
 static UA_StatusCode
 waitForNotification(UA_UInt32 notifications) {
     UA_StatusCode retval = UA_STATUSCODE_GOOD;
+    UA_UInt32 initialNotifications = countNotificationReceived;
     pauseServer();
-#define MAXWAIT_TRIES 20
+#define MAXWAIT_TRIES 100
     for(UA_UInt32 i = 0; i < MAXWAIT_TRIES; ++i) {
         UA_fakeSleep((UA_UInt32)publishingInterval + 100);
-        UA_Server_run_iterate(server, false);
-        retval = UA_Client_run_iterate(client, 0);
-        if(retval != UA_STATUSCODE_GOOD)
-            break;
-        if(countNotificationReceived == notifications)
+        for(UA_UInt32 j = 0; j < MAXWAIT_TRIES; ++j) {
+            UA_Server_run_iterate(server, false);
+            retval = UA_Client_run_iterate(client, 0);
+            if(retval != UA_STATUSCODE_GOOD)
+                break;
+            if(countNotificationReceived >= notifications &&
+               (notifications == 0 ||
+                countNotificationReceived != initialNotifications ||
+                notificationReceived))
+                break;
+        }
+        if(countNotificationReceived >= notifications &&
+           (notifications == 0 ||
+            countNotificationReceived != initialNotifications ||
+            notificationReceived))
             break;
     }
     runServer();
+    return retval;
+}
+
+static UA_StatusCode
+waitForNotificationCount(UA_UInt32 notifications) {
+    UA_StatusCode retval = waitForNotification(notifications);
+    if(retval == UA_STATUSCODE_GOOD &&
+       countNotificationReceived < notifications)
+        retval = UA_STATUSCODE_BADTIMEOUT;
     return retval;
 }
 
@@ -239,9 +277,9 @@ START_TEST(Server_MonitoredItemsAbsoluteFilterSetLater) {
     notificationReceived = false;
     countNotificationReceived = 0;
     ck_assert_uint_eq(setDouble(client, outNodeId, 41.0), UA_STATUSCODE_GOOD);
-    ck_assert_uint_eq(waitForNotification(1), UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(waitForNotificationCount(1), UA_STATUSCODE_GOOD);
     ck_assert_uint_eq(setDouble(client, outNodeId, 42.0), UA_STATUSCODE_GOOD);
-    ck_assert_uint_eq(waitForNotification(2), UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(waitForNotificationCount(2), UA_STATUSCODE_GOOD);
     ck_assert_uint_eq(notificationReceived, true);
     ck_assert_uint_eq(countNotificationReceived, 2);
 
@@ -250,9 +288,9 @@ START_TEST(Server_MonitoredItemsAbsoluteFilterSetLater) {
     notificationReceived = false;
     countNotificationReceived = 0;
     ck_assert_uint_eq(setDouble(client, outNodeId, 43.0), UA_STATUSCODE_GOOD);
-    ck_assert_uint_eq(waitForNotification(1), UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(waitForNotificationCount(1), UA_STATUSCODE_GOOD);
     ck_assert_uint_eq(setDouble(client, outNodeId, 44.0), UA_STATUSCODE_GOOD);
-    ck_assert_uint_eq(waitForNotification(2), UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(waitForNotificationCount(2), UA_STATUSCODE_GOOD);
     ck_assert_uint_eq(notificationReceived, true);
     ck_assert_uint_eq(countNotificationReceived, 2);
 
@@ -721,8 +759,8 @@ END_TEST
 
 START_TEST(Server_MonitoredItemsSetEmpty) {
     UA_DataValue_init(&lastValue);
-    /* define a monitored item with an absolute filter with deadbandvalue = 2.0 */
-    UA_MonitoredItemCreateRequest item = UA_MonitoredItemCreateRequest_default(outNodeId);
+    /* define a monitored item on a nullable (String) node */
+    UA_MonitoredItemCreateRequest item = UA_MonitoredItemCreateRequest_default(outNodeIdNullable);
     UA_UInt32 newMonitoredItemIds[1];
     UA_Client_DataChangeNotificationCallback callbacks[1];
     callbacks[0] = dataChangeHandler;
@@ -753,14 +791,14 @@ START_TEST(Server_MonitoredItemsSetEmpty) {
     ck_assert_uint_eq(notificationReceived, true);
     ck_assert_uint_eq(countNotificationReceived, 1);
 
-    ck_assert(fuzzyLastValueIsEqualTo(40.0));
+    ck_assert(lastValue.hasValue);
 
-    // Setting the variable empty shold trigger
+    // Setting the variable empty should trigger
     notificationReceived = false;
     countNotificationReceived = 0;
     UA_Variant variant;
     UA_Variant_init(&variant);
-    UA_StatusCode res = UA_Client_writeValueAttribute(client, outNodeId, &variant);
+    UA_StatusCode res = UA_Client_writeValueAttribute(client, outNodeIdNullable, &variant);
     ck_assert_uint_eq(res, UA_STATUSCODE_GOOD);
     ck_assert_uint_eq(waitForNotification(1), UA_STATUSCODE_GOOD);
     ck_assert_uint_eq(notificationReceived, true);

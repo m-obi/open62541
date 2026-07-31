@@ -19,7 +19,7 @@
 
 void UA_Session_init(UA_Session *session) {
     memset(session, 0, sizeof(UA_Session));
-    session->availableContinuationPoints = UA_MAXCONTINUATIONPOINTS;
+    TAILQ_INIT(&session->continuationPoints);
 #ifdef UA_ENABLE_SUBSCRIPTIONS
     SIMPLEQ_INIT(&session->responseQueue);
     TAILQ_INIT(&session->subscriptions);
@@ -34,7 +34,7 @@ void UA_Session_clear(UA_Session *session, UA_Server* server) {
 #ifdef UA_ENABLE_SUBSCRIPTIONS
     UA_Subscription *sub, *tempsub;
     TAILQ_FOREACH_SAFE(sub, &session->subscriptions, sessionListEntry, tempsub) {
-        UA_Subscription_delete(server, sub);
+        UA_Subscription_delete(server, sub, true);
     }
 #endif
 
@@ -50,13 +50,9 @@ void UA_Session_clear(UA_Session *session, UA_Server* server) {
     UA_NodeId_clear(&session->sessionId);
     UA_String_clear(&session->sessionName);
     UA_ByteString_clear(&session->serverNonce);
-    struct ContinuationPoint *cp, *next = session->continuationPoints;
-    while((cp = next)) {
-        next = ContinuationPoint_clear(cp);
-        UA_free(cp);
-    }
-    session->continuationPoints = NULL;
-    session->availableContinuationPoints = UA_MAXCONTINUATIONPOINTS;
+    UA_ByteString_clear(&session->clientNonce);
+    ContinuationPointQueue_clear(&session->continuationPoints);
+    session->continuationPointsSize = 0;
 
     UA_KeyValueMap_clear(&session->attributes);
 
@@ -148,10 +144,11 @@ UA_Session_generateNonce(UA_Session *session) {
         spC = session->sessionSpContext;
     }
 
-    /* The nonce is at least 32 byte (force the #None SecurityPolicy) */
-    size_t nonceLength = sp->nonceLength;
-    if(nonceLength < 32)
-        nonceLength = 32;
+    /* The session ServerNonce is a 32-byte application nonce. This is
+     * independent of the SecurityPolicy's SecureChannel nonce length (for ECC
+     * policies that is the 64-byte ephemeral key, which is NOT the session
+     * nonce). */
+    size_t nonceLength = 32;
 
     /* Is the length of the previous nonce correct? */
     if(session->serverNonce.length != nonceLength) {
@@ -162,6 +159,9 @@ UA_Session_generateNonce(UA_Session *session) {
             return res;
     }
 
+    /* Generate plain random data. Ensure data[0] is not the 'e' of the "eph"
+     * trigger that some ECC policies use to produce an ephemeral key. */
+    session->serverNonce.data[0] = 0;
     return sp->generateNonce(sp, spC, &session->serverNonce);
 }
 
@@ -319,6 +319,8 @@ UA_Server_setSessionAttribute(UA_Server *server, const UA_NodeId *sessionId,
                               const UA_QualifiedName key, const UA_Variant *value) {
     if(protectedAttribute(key))
         return UA_STATUSCODE_BADNOTWRITABLE;
+    if(!sessionId)
+        return UA_STATUSCODE_BADINVALIDARGUMENT;
 #ifdef UA_ENABLE_RBAC
     if(UA_QualifiedName_equal(&key, &rbacRolesKey)) {
         lockServer(server);
@@ -355,6 +357,8 @@ UA_Server_deleteSessionAttribute(UA_Server *server, const UA_NodeId *sessionId,
                                  const UA_QualifiedName key) {
     if(protectedAttribute(key))
         return UA_STATUSCODE_BADNOTWRITABLE;
+    if(!sessionId)
+        return UA_STATUSCODE_BADINVALIDARGUMENT;
 #ifdef UA_ENABLE_RBAC
     if(UA_QualifiedName_equal(&key, &rbacRolesKey)) {
         lockServer(server);
@@ -385,6 +389,8 @@ getSessionAttribute(UA_Server *server, const UA_NodeId *sessionId,
                     UA_Boolean copy) {
     if(!outValue)
         return UA_STATUSCODE_BADINTERNALERROR;
+    if(!sessionId)
+        return UA_STATUSCODE_BADINVALIDARGUMENT;
 
     UA_Session *session = getSessionById(server, sessionId);
     if(!session)

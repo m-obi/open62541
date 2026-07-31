@@ -6,6 +6,7 @@
  *    Copyright 2017 (c) Fraunhofer IOSB (Author: Julius Pfrommer)
  *    Copyright 2017 (c) Stefan Profanter, fortiss GmbH
  *    Copyright 2025 (c) o6 Automation GmbH (Author: Julius Pfrommer)
+ *    Copyright 2026 (c) o6 Automation GmbH (Author: Andreas Ebner)
  */
 
 #ifndef UA_PLUGIN_SECURITYPOLICY_H_
@@ -158,12 +159,24 @@ typedef struct {
      *         is known. */
     size_t (*getRemotePlainTextBlockSize)(const UA_SecurityPolicy *policy,
                                           const void *channelContext);
+
+    /* Returns the IV (initialization vector) length for symmetric encryption.
+     * For AEAD ciphers (e.g. ChaCha20-Poly1305) the IV length differs from the
+     * block size. If NULL, the block size is used as the IV length (which is
+     * correct for traditional block ciphers like AES-CBC).
+     *
+     * @param policy The SecurityPolicy to which the callback belongs.
+     * @param channelContext The context to retrieve data from.
+     * @return The IV length in bytes. */
+    size_t (*getLocalIvLength)(const UA_SecurityPolicy *policy,
+                               const void *channelContext);
 } UA_SecurityPolicyEncryptionAlgorithm;
 
 typedef enum {
     UA_SECURITYPOLICYTYPE_NONE = 0,
     UA_SECURITYPOLICYTYPE_RSA = 1,
-    UA_SECURITYPOLICYTYPE_ECC = 2
+    UA_SECURITYPOLICYTYPE_ECC = 2,
+    UA_SECURITYPOLICYTYPE_ECC_AEAD = 3
 } UA_SecurityPolicyType;
 
 struct UA_SecurityPolicy {
@@ -266,6 +279,22 @@ struct UA_SecurityPolicy {
                                     void *channelContext,
                                     const UA_ByteString *iv);
 
+    /* Sets the message security parameters for AEAD nonce derivation.
+     * Called before each symmetric encrypt/decrypt for ECC_AEAD policies.
+     * NULL for non-AEAD policies.
+     *
+     * @param policy The SecurityPolicy to which the callback belongs.
+     * @param channelContext The context to work on.
+     * @param tokenId The SecurityToken ID for nonce masking.
+     * @param previousSequenceNumber The previous sequence number for nonce masking.
+     * @param additionalAuthData The header bytes used as AAD for AEAD. */
+    UA_StatusCode (*setMessageSecurityParameters)(
+        const UA_SecurityPolicy *policy,
+        void *channelContext,
+        UA_UInt32 tokenId,
+        UA_UInt32 previousSequenceNumber,
+        const UA_ByteString *additionalAuthData);
+
     /* Compares the supplied certificate with the remote certificate stored in
      * the channel context.
      *
@@ -361,6 +390,44 @@ struct UA_SecurityPolicy {
     /* Deletes the dynamic content of the policy */
     void (*clear)(UA_SecurityPolicy *policy);
 };
+
+/* True if the SecurityPolicy requires the OPC UA Part 6 v1.05.07
+ * SecureChannelEnhancements behavior (see the conformance unit "Security
+ * SecureChannelEnhancements True"). The changed behavior is implemented in the
+ * core library, not in the SecurityPolicy itself. Detected from the policy URI
+ * so it does not depend on a struct member - this keeps the SecurityPolicy
+ * layout stable across the 1.5 release family. */
+UA_EXPORT UA_Boolean
+UA_SecurityPolicy_isEnhancedSecurity(const UA_SecurityPolicy *policy);
+
+/* True if the SecurityPolicy uses the legacy SequenceNumber handling (the OPC
+ * UA reference stack's LegacySequenceNumbers = true): the channel SequenceNumber
+ * starts at 1 and rolls over with the "< 1024" rule. This is the case for None
+ * and the RSA policies (Basic*, Aes*_RsaOaep/RsaPss). The ECC policies use the
+ * non-legacy scheme (start at 0, wrap UA_UINT32_MAX -> 0). Detected from the
+ * policy URI so it does not depend on a struct member - this keeps the
+ * SecurityPolicy layout stable across the 1.5 release family. A NULL policy is
+ * treated as legacy. */
+UA_EXPORT UA_Boolean
+UA_SecurityPolicy_useLegacySequenceNumbers(const UA_SecurityPolicy *policy);
+
+/* OPC UA Part 6 v1.05.07 (SecureChannelEnhancements): hash a certificate (the
+ * leaf, DER) with the hash of the policy's elliptic curve - SHA-256 for the
+ * nistP256 curve, SHA-384 for nistP384. Used to build the channel-bound
+ * CreateSession / ActivateSession SignatureData.
+ *
+ * This is NOT the OPN-header Certificate thumbprint: that thumbprint uses the
+ * SecurityPolicy's CertificateThumbprintAlgorithm (SHA-1 by default) and is
+ * produced by makeCertThumbprint. The digest here is selected from the policy
+ * URI's curve; the implementation is provided by the crypto backend.
+ *
+ * @param policy The policy whose curve selects the hash algorithm.
+ * @param certificate The certificate to hash (DER; leaf is used).
+ * @param hash Output buffer; allocated by the callee. */
+UA_EXPORT UA_StatusCode
+UA_SecurityPolicy_hashCertificate(const UA_SecurityPolicy *policy,
+                                  const UA_ByteString *certificate,
+                                  UA_ByteString *hash);
 
 /**
  * PubSub SecurityPolicy

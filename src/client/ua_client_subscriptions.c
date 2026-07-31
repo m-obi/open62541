@@ -27,20 +27,36 @@ struct UA_Client_MonitoredItem_ForDelete {
 /* Subscriptions */
 /*****************/
 
-static enum ZIP_CMP
 /* For ZIP_TREE we use clientHandle comparison */
+static enum ZIP_CMP
 UA_ClientHandle_cmp(const void *a, const void *b) {
     const UA_Client_MonitoredItem *aa = (const UA_Client_MonitoredItem *)a;
     const UA_Client_MonitoredItem *bb = (const UA_Client_MonitoredItem *)b;
-    if(aa->clientHandle < bb->clientHandle)
+    if(aa->parameters.clientHandle < bb->parameters.clientHandle)
         return ZIP_CMP_LESS;
-    if(aa->clientHandle > bb->clientHandle)
+    if(aa->parameters.clientHandle > bb->parameters.clientHandle)
         return ZIP_CMP_MORE;
     return ZIP_CMP_EQ;
 }
 
 ZIP_FUNCTIONS(MonitorItemsTree, UA_Client_MonitoredItem, zipfields,
               UA_Client_MonitoredItem, zipfields, UA_ClientHandle_cmp)
+
+static UA_Client_MonitoredItem *
+findMonitoredItemByHandle(UA_Client_Subscription *sub, UA_UInt32 clientHandle) {
+    UA_Client_MonitoredItem dummy;
+    memset(&dummy, 0, sizeof(dummy));
+    dummy.parameters.clientHandle = clientHandle;
+    return ZIP_FIND(MonitorItemsTree, &sub->monitoredItems, &dummy);
+}
+
+static void *
+MonitoredItem_findPendingByHandle(void *data, UA_Client_MonitoredItem *mon) {
+    UA_UInt32 clientHandle = *(UA_UInt32*)data;
+    if(mon->pendingParameters.clientHandle == clientHandle)
+        return mon;
+    return NULL;
+}
 
 static void
 MonitoredItem_delete(UA_Client *client, UA_Client_Subscription *sub,
@@ -83,8 +99,8 @@ Subscriptions_create_handler(UA_Client *client, void *data,
     Subscription_create(client, newSub, response);
 
 cleanup:
-    if(cc->userCallback)
-        cc->userCallback(client, cc->userData, requestId, response);
+    if(cc->callback.createSubscription)
+        cc->callback.createSubscription(client, cc->userData, requestId, response);
     UA_free(cc);
 }
 
@@ -145,7 +161,7 @@ UA_Client_Subscriptions_create_async(UA_Client *client, const UA_CreateSubscript
     sub->statusChangeCallback = statusChangeCallback;
     sub->deleteCallback = deleteCallback;
 
-    cc->userCallback = (UA_ClientAsyncServiceCallback)createCallback;
+    cc->callback.createSubscription = createCallback;
     cc->userData = userdata;
     cc->clientData = sub;
 
@@ -156,7 +172,7 @@ UA_Client_Subscriptions_create_async(UA_Client *client, const UA_CreateSubscript
                                  Subscriptions_create_handler,
                                  &UA_TYPES[UA_TYPES_CREATESUBSCRIPTIONRESPONSE],
                                  cc, requestId);
-    if (res != UA_STATUSCODE_GOOD) {
+    if(res != UA_STATUSCODE_GOOD) {
         UA_free(cc);
         UA_free(sub);
     }
@@ -197,8 +213,8 @@ Subscription_modify_handler(UA_Client *client, void *data,
                     (UA_UInt32)(uintptr_t)cc->clientData);
     }
 
-    if(cc->userCallback)
-        cc->userCallback(client, cc->userData, requestId, response);
+    if(cc->callback.modifySubscription)
+        cc->callback.modifySubscription(client, cc->userData, requestId, response);
     UA_free(cc);
 }
 
@@ -277,6 +293,12 @@ UA_Client_Subscriptions_modify_async(UA_Client *client,
                                      void *userdata, UA_UInt32 *requestId) {
     lockClient(client);
 
+    UA_StatusCode res = __Client_AsyncServiceAdmission(client);
+    if(res != UA_STATUSCODE_GOOD) {
+        unlockClient(client);
+        return res;
+    }
+
     UA_Client_Subscription *sub = findSubscriptionById(client, request.subscriptionId);
     if(!sub) {
         unlockClient(client);
@@ -291,14 +313,14 @@ UA_Client_Subscriptions_modify_async(UA_Client *client,
 
     cc->clientData = (void *)(uintptr_t)request.subscriptionId;
     cc->userData = userdata;
-    cc->userCallback = (UA_ClientAsyncServiceCallback)callback;
+    cc->callback.modifySubscription = callback;
 
-    UA_StatusCode res =
-        __Client_AsyncService(client, &request,
-                              &UA_TYPES[UA_TYPES_MODIFYSUBSCRIPTIONREQUEST],
-                              Subscription_modify_handler,
-                              &UA_TYPES[UA_TYPES_MODIFYSUBSCRIPTIONRESPONSE],
-                              cc, requestId);
+    res = __Client_AsyncServiceAdmitted(
+        client, &request, &UA_TYPES[UA_TYPES_MODIFYSUBSCRIPTIONREQUEST],
+        Subscription_modify_handler,
+        &UA_TYPES[UA_TYPES_MODIFYSUBSCRIPTIONRESPONSE], cc, requestId);
+    if(res != UA_STATUSCODE_GOOD)
+        UA_free(cc);
 
     unlockClient(client);
     return res;
@@ -374,7 +396,7 @@ __Client_Subscription_processDelete(UA_Client *client,
 
 typedef struct {
     UA_DeleteSubscriptionsRequest request;
-    UA_ClientAsyncServiceCallback userCallback;
+    UA_ClientAsyncDeleteSubscriptionsCallback userCallback;
     void *userData;
 } DeleteSubscriptionCallback;
 
@@ -392,7 +414,8 @@ Subscriptions_delete_handler(UA_Client *client, void *data,
     __Client_Subscription_processDelete(client, &dsc->request, response);
 
     /* Userland Callback */
-    dsc->userCallback(client, dsc->userData, requestId, response);
+    if(dsc->userCallback)
+        dsc->userCallback(client, dsc->userData, requestId, response);
 
     /* Cleanup */
     UA_DeleteSubscriptionsRequest_clear(&dsc->request);
@@ -411,7 +434,7 @@ UA_Client_Subscriptions_delete_async(UA_Client *client,
         UA_malloc(sizeof(DeleteSubscriptionCallback));
     if(!dsc)
         return UA_STATUSCODE_BADOUTOFMEMORY;
-    dsc->userCallback = (UA_ClientAsyncServiceCallback)callback;
+    dsc->userCallback = callback;
     dsc->userData = userdata;
     UA_StatusCode res = UA_DeleteSubscriptionsRequest_copy(&request, &dsc->request);
     if(res != UA_STATUSCODE_GOOD) {
@@ -425,7 +448,7 @@ UA_Client_Subscriptions_delete_async(UA_Client *client,
                                    Subscriptions_delete_handler,
                                    &UA_TYPES[UA_TYPES_DELETESUBSCRIPTIONSRESPONSE],
                                    dsc, requestId);
-    if (res != UA_STATUSCODE_GOOD) {
+    if(res != UA_STATUSCODE_GOOD) {
         UA_DeleteSubscriptionsRequest_clear(&dsc->request);
         UA_free(dsc);
     }
@@ -481,6 +504,15 @@ UA_Client_Subscriptions_deleteSingle(UA_Client *client, UA_UInt32 subscriptionId
 /******************/
 
 static void
+EventFields_clear(UA_KeyValueMap *eventFields) {
+    /* The values are borrowed from the PublishResponse. Detach them before
+     * clearing the map-owned field-name keys. */
+    for(size_t i = 0; i < eventFields->mapSize; i++)
+        UA_Variant_init(&eventFields->map[i].value);
+    UA_KeyValueMap_clear(eventFields);
+}
+
+static void
 MonitoredItem_delete(UA_Client *client, UA_Client_Subscription *sub,
                      UA_Client_MonitoredItem *mon) {
     UA_LOCK_ASSERT(&client->clientMutex);
@@ -489,15 +521,14 @@ MonitoredItem_delete(UA_Client *client, UA_Client_Subscription *sub,
     if(mon->deleteCallback)
         mon->deleteCallback(client, sub->subscriptionId, sub->context,
                             mon->monitoredItemId, mon->context);
-    for(size_t i = 0; i < mon->eventFields.mapSize; i++) {
-        UA_Variant_init(&mon->eventFields.map[i].value);
-    }
-    UA_KeyValueMap_clear(&mon->eventFields);
+    EventFields_clear(&mon->eventFields);
+    UA_MonitoringParameters_clear(&mon->parameters);
+    UA_MonitoringParameters_clear(&mon->pendingParameters);
     UA_free(mon);
 }
 
 static UA_StatusCode
-prepareEventFieldsMap(UA_Client_MonitoredItem *newMon,
+prepareEventFieldsMap(UA_KeyValueMap *eventFields,
                       UA_MonitoringParameters *params) {
     /* Get the EventFilter */
     UA_ExtensionObject *eo = &params->filter;
@@ -511,16 +542,16 @@ prepareEventFieldsMap(UA_Client_MonitoredItem *newMon,
         return UA_STATUSCODE_GOOD;
 
     /* Allocate the map */
-    newMon->eventFields.map = (UA_KeyValuePair*)
+    eventFields->map = (UA_KeyValuePair*)
         UA_calloc(ef->selectClausesSize, sizeof(UA_KeyValuePair));
-    if(!newMon->eventFields.map)
+    if(!eventFields->map)
         return UA_STATUSCODE_BADOUTOFMEMORY;
-    newMon->eventFields.mapSize = ef->selectClausesSize;
+    eventFields->mapSize = ef->selectClausesSize;
 
     /* Create the key-strings for the fields */
-    for(size_t i = 0; i < newMon->eventFields.mapSize; i++) {
+    for(size_t i = 0; i < eventFields->mapSize; i++) {
         res |= UA_SimpleAttributeOperand_print(&ef->selectClauses[i],
-                                               &newMon->eventFields.map[i].key.name);
+                                               &eventFields->map[i].key.name);
     }
 
     return res;
@@ -538,22 +569,20 @@ MonitoredItem_createBegin(UA_Client *client, UA_Client_Subscription *sub,
     if(!mon)
         return UA_STATUSCODE_BADOUTOFMEMORY;
 
-    /* Cache the field name map */
-    mon->isEventMonitoredItem =
-        (item->itemToMonitor.attributeId == UA_ATTRIBUTEID_EVENTNOTIFIER);
-    if(mon->isEventMonitoredItem) {
-        UA_StatusCode res = prepareEventFieldsMap(mon, &item->requestedParameters);
-        if(res != UA_STATUSCODE_GOOD) {
-            UA_free(mon);
-            return res;
-        }
+    /* Set a unique ClientHandle and retain the active parameters. */
+    item->requestedParameters.clientHandle = ++client->monitoredItemHandles;
+    UA_StatusCode res =
+        UA_MonitoringParameters_copy(&item->requestedParameters,
+                                     &mon->parameters);
+    if(res != UA_STATUSCODE_GOOD) {
+        UA_free(mon);
+        return res;
     }
 
-    /* Set a unique ClientHandle */
-    item->requestedParameters.clientHandle = ++client->monitoredItemHandles;
+    mon->isEventMonitoredItem =
+        (item->itemToMonitor.attributeId == UA_ATTRIBUTEID_EVENTNOTIFIER);
 
     /* Fill in members and add to the client  */
-    mon->clientHandle = item->requestedParameters.clientHandle;
     mon->context = context;
     mon->deleteCallback = deleteCallback;
     mon->handler.dataChangeCallback =
@@ -562,7 +591,7 @@ MonitoredItem_createBegin(UA_Client *client, UA_Client_Subscription *sub,
 
     UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                  "Subscription %" PRIu32 " | Added a MonitoredItem with handle %" PRIu32,
-                 sub->subscriptionId, mon->clientHandle);
+                 sub->subscriptionId, mon->parameters.clientHandle);
 
     *outMon = mon;
     return UA_STATUSCODE_GOOD;
@@ -790,12 +819,10 @@ MonitoredItems_create_async_handler(UA_Client *client, void *data,
         response->responseHeader.serviceResult = UA_STATUSCODE_BADSUBSCRIPTIONIDINVALID;
 
     /* Update the MonitoredItems */
-    UA_Client_MonitoredItem dummy;
     for(size_t i = 0; sub && i < monSize; i++) {
         /* Get the MonitoredItem from the ClientHandle */
-        dummy.clientHandle = monHandles[i];
         UA_Client_MonitoredItem *mon =
-            ZIP_FIND(MonitorItemsTree, &sub->monitoredItems, &dummy);
+            findMonitoredItemByHandle(sub, monHandles[i]);
         if(!mon)
             continue;
 
@@ -812,11 +839,8 @@ MonitoredItems_create_async_handler(UA_Client *client, void *data,
     }
 
     /* Notify the application */
-    if(cc->userCallback) {
-        UA_ClientAsyncCreateMonitoredItemsCallback cb =
-            (UA_ClientAsyncCreateMonitoredItemsCallback)cc->userCallback;
-        cb(client, cc->userData, requestId, response);
-    }
+    if(cc->callback.createMonitoredItems)
+        cc->callback.createMonitoredItems(client, cc->userData, requestId, response);
 
     /* Clean up */
     UA_free(handles);
@@ -830,9 +854,13 @@ Client_MonitoredItems_createAsync(UA_Client *client,
                                   const UA_CreateMonitoredItemsRequest *constRequest,
                                   void **contexts, void **handlingCallbacks,
                                   UA_Client_DeleteMonitoredItemCallback *deleteCallbacks,
-                                  UA_ClientAsyncServiceCallback createCallback,
+                                  UA_ClientAsyncCreateMonitoredItemsCallback createCallback,
                                   void *userdata, UA_UInt32 *requestId) {
     UA_LOCK_ASSERT(&client->clientMutex);
+
+    UA_StatusCode res = __Client_AsyncServiceAdmission(client);
+    if(res != UA_STATUSCODE_GOOD)
+        return res;
 
     /* Get the Subscription */
     UA_Client_Subscription *sub =
@@ -847,8 +875,7 @@ Client_MonitoredItems_createAsync(UA_Client *client,
     /* Make a mutable copy. We modify the request to set the internal
      * clientHandle. */
     UA_CreateMonitoredItemsRequest request;
-    UA_StatusCode res =
-        UA_CreateMonitoredItemsRequest_copy(constRequest, &request);
+    res = UA_CreateMonitoredItemsRequest_copy(constRequest, &request);
     if(res != UA_STATUSCODE_GOOD)
         return res;
 
@@ -899,18 +926,17 @@ Client_MonitoredItems_createAsync(UA_Client *client,
     handles[0] = sub->subscriptionId;
     handles[1] = (UA_UInt32)request.itemsToCreateSize;
     for(size_t i = 0; i < request.itemsToCreateSize; i++) {
-        handles[i+2] = mons[i]->clientHandle;
+        handles[i+2] = mons[i]->parameters.clientHandle;
     }
     cc->clientData = handles;
-    cc->userCallback = createCallback;
+    cc->callback.createMonitoredItems = createCallback;
     cc->userData = userdata;
 
     /* Call the service asynchronously */
-    res = __Client_AsyncService(client, &request,
-                                &UA_TYPES[UA_TYPES_CREATEMONITOREDITEMSREQUEST],
-                                MonitoredItems_create_async_handler,
-                                &UA_TYPES[UA_TYPES_CREATEMONITOREDITEMSRESPONSE],
-                                cc, requestId);
+    res = __Client_AsyncServiceAdmitted(
+        client, &request, &UA_TYPES[UA_TYPES_CREATEMONITOREDITEMSREQUEST],
+        MonitoredItems_create_async_handler,
+        &UA_TYPES[UA_TYPES_CREATEMONITOREDITEMSRESPONSE], cc, requestId);
 
     /* Manually clean up the context in the failure case */
     if(res != UA_STATUSCODE_GOOD) {
@@ -939,7 +965,7 @@ UA_Client_MonitoredItems_createDataChanges_async(UA_Client *client,
     UA_StatusCode res =
         Client_MonitoredItems_createAsync(client, &request, contexts,
                                           (void **)callbacks, deleteCallbacks,
-                                          (UA_ClientAsyncServiceCallback)createCallback,
+                                          createCallback,
                                           userdata, requestId);
     unlockClient(client);
     return res;
@@ -957,7 +983,7 @@ UA_Client_MonitoredItems_createEvents_async(UA_Client *client,
     UA_StatusCode res =
         Client_MonitoredItems_createAsync(client, &request, contexts,
                                           (void **)callbacks, deleteCallbacks,
-                                          (UA_ClientAsyncServiceCallback)createCallback,
+                                          createCallback,
                                           userdata, requestId);
     unlockClient(client);
     return res;
@@ -1014,8 +1040,8 @@ MonitoredItems_delete_handler(UA_Client *client, void *d, UA_UInt32 requestId, v
     MonitoredItems_delete(client, sub, request, response);
 
 cleanup:
-    if(cc->userCallback)
-        cc->userCallback(client, cc->userData, requestId, response);
+    if(cc->callback.deleteMonitoredItems)
+        cc->callback.deleteMonitoredItems(client, cc->userData, requestId, response);
     UA_DeleteMonitoredItemsRequest_delete(request);
     UA_free(cc);
 
@@ -1072,7 +1098,7 @@ UA_Client_MonitoredItems_delete_async(UA_Client *client,
 
     UA_DeleteMonitoredItemsRequest_copy(&request, req_copy);
     cc->clientData = req_copy;
-    cc->userCallback = (UA_ClientAsyncServiceCallback)callback;
+    cc->callback.deleteMonitoredItems = callback;
     cc->userData = userdata;
 
     UA_StatusCode res =
@@ -1081,7 +1107,7 @@ UA_Client_MonitoredItems_delete_async(UA_Client *client,
                                  MonitoredItems_delete_handler,
                                  &UA_TYPES[UA_TYPES_DELETEMONITOREDITEMSRESPONSE],
                                  cc, requestId);
-    if (res != UA_STATUSCODE_GOOD) {
+    if(res != UA_STATUSCODE_GOOD) {
         UA_DeleteMonitoredItemsRequest_delete(req_copy);
         UA_free(cc);
     }
@@ -1131,15 +1157,70 @@ findMonitoredItemById(UA_Client_Subscription *sub, UA_UInt32 monitoredItemId) {
                  MonitoredItem_findByID, &monitoredItemId);
 }
 
-static void
-setExistingClientHandles(UA_Client_Subscription *sub,
-                         UA_ModifyMonitoredItemsRequest *request) {
+static UA_StatusCode
+MonitoredItems_prepareModify(UA_Client *client, UA_Client_Subscription *sub,
+                             UA_ModifyMonitoredItemsRequest *request) {
+    UA_STACKARRAY(UA_Client_MonitoredItem*, mons, request->itemsToModifySize);
+    UA_STACKARRAY(UA_MonitoringParameters, preparedParameters,
+                  request->itemsToModifySize);
+    memset(mons, 0, sizeof(UA_Client_MonitoredItem*) *
+           request->itemsToModifySize);
+    memset(preparedParameters, 0, sizeof(UA_MonitoringParameters) *
+           request->itemsToModifySize);
+
+    /* Prepare every settings slot before changing the MonitoredItems. So an
+     * allocation failure leaves all active and pending settings untouched. */
     for(size_t i = 0; i < request->itemsToModifySize; ++i) {
         UA_MonitoredItemModifyRequest *mimr = &request->itemsToModify[i];
+        mimr->requestedParameters.clientHandle = 0;
+        mons[i] = findMonitoredItemById(sub, mimr->monitoredItemId);
+        if(!mons[i])
+            continue;
+
+        mimr->requestedParameters.clientHandle = ++client->monitoredItemHandles;
+        UA_StatusCode res =
+            UA_MonitoringParameters_copy(&mimr->requestedParameters,
+                                         &preparedParameters[i]);
+        if(res != UA_STATUSCODE_GOOD) {
+            for(size_t j = 0; j <= i; j++)
+                UA_MonitoringParameters_clear(&preparedParameters[j]);
+            return res;
+        }
+    }
+
+    /* Commit the prepared settings. A newer modification supersedes a pending
+     * generation that has not produced a notification yet. */
+    for(size_t i = 0; i < request->itemsToModifySize; ++i) {
+        UA_Client_MonitoredItem *mon = mons[i];
+        if(!mon)
+            continue;
+        UA_MonitoringParameters_clear(&mon->pendingParameters);
+        mon->pendingParameters = preparedParameters[i];
+        memset(&preparedParameters[i], 0, sizeof(UA_MonitoringParameters));
+    }
+    return UA_STATUSCODE_GOOD;
+}
+
+static void
+MonitoredItems_reconcileModify(UA_Client_Subscription *sub,
+                               const UA_ModifyMonitoredItemsRequest *request,
+                               UA_ModifyMonitoredItemsResponse *response) {
+    UA_Boolean validResponse = response &&
+        response->responseHeader.serviceResult == UA_STATUSCODE_GOOD &&
+        response->resultsSize == request->itemsToModifySize;
+    if(response && response->responseHeader.serviceResult == UA_STATUSCODE_GOOD &&
+       !validResponse)
+        response->responseHeader.serviceResult = UA_STATUSCODE_BADINTERNALERROR;
+
+    for(size_t i = 0; i < request->itemsToModifySize; ++i) {
+        if(validResponse && response->results[i].statusCode == UA_STATUSCODE_GOOD)
+            continue;
+        const UA_MonitoredItemModifyRequest *mimr = &request->itemsToModify[i];
         UA_Client_MonitoredItem *mon =
             findMonitoredItemById(sub, mimr->monitoredItemId);
-        if(mon)
-            mimr->requestedParameters.clientHandle = mon->clientHandle;
+        if(mon && mon->pendingParameters.clientHandle ==
+                  mimr->requestedParameters.clientHandle)
+            UA_MonitoringParameters_clear(&mon->pendingParameters);
     }
 }
 
@@ -1153,7 +1234,7 @@ UA_Client_MonitoredItems_modify(UA_Client *client,
     UA_ModifyMonitoredItemsRequest modifiedRequest;
     UA_StatusCode res = UA_ModifyMonitoredItemsRequest_copy(&request, &modifiedRequest);
     if(res != UA_STATUSCODE_GOOD) {
-        response.responseHeader.serviceResult = UA_STATUSCODE_BADSUBSCRIPTIONIDINVALID;
+        response.responseHeader.serviceResult = res;
         return response;
     }
 
@@ -1168,13 +1249,20 @@ UA_Client_MonitoredItems_modify(UA_Client *client,
         return response;
     }
 
-    /* Reuse the existing ClientHandles for the MonitoredItems */
-    setExistingClientHandles(sub, &modifiedRequest);
+    res = MonitoredItems_prepareModify(client, sub, &modifiedRequest);
+    if(res != UA_STATUSCODE_GOOD) {
+        response.responseHeader.serviceResult = res;
+        unlockClient(client);
+        UA_ModifyMonitoredItemsRequest_clear(&modifiedRequest);
+        return response;
+    }
 
     /* Call the service */
     __Client_Service(client, &modifiedRequest,
                      &UA_TYPES[UA_TYPES_MODIFYMONITOREDITEMSREQUEST], &response,
                      &UA_TYPES[UA_TYPES_MODIFYMONITOREDITEMSRESPONSE]);
+
+    MonitoredItems_reconcileModify(sub, &modifiedRequest, &response);
 
     unlockClient(client);
 
@@ -1183,40 +1271,93 @@ UA_Client_MonitoredItems_modify(UA_Client *client,
     return response;
 }
 
+static void
+MonitoredItems_modify_async_handler(UA_Client *client, void *data,
+                                    UA_UInt32 requestId, void *resp) {
+    CustomCallback *cc = (CustomCallback*)data;
+    UA_ModifyMonitoredItemsRequest *request =
+        (UA_ModifyMonitoredItemsRequest*)cc->clientData;
+    UA_ModifyMonitoredItemsResponse *response =
+        (UA_ModifyMonitoredItemsResponse*)resp;
+
+    lockClient(client);
+    UA_Client_Subscription *sub =
+        findSubscriptionById(client, request->subscriptionId);
+    if(sub)
+        MonitoredItems_reconcileModify(sub, request, response);
+
+    if(cc->callback.modifyMonitoredItems)
+        cc->callback.modifyMonitoredItems(client, cc->userData,
+                                          requestId, response);
+
+    UA_ModifyMonitoredItemsRequest_delete(request);
+    UA_free(cc);
+    unlockClient(client);
+}
+
 UA_StatusCode
 UA_Client_MonitoredItems_modify_async(UA_Client *client,
                                       const UA_ModifyMonitoredItemsRequest request,
                                       UA_ClientAsyncModifyMonitoredItemsCallback callback,
                                       void *userdata, UA_UInt32 *requestId) {
-    /* Make a modifiable copy of the request */
-    UA_ModifyMonitoredItemsRequest modifiedRequest;
-    UA_StatusCode res = UA_ModifyMonitoredItemsRequest_copy(&request, &modifiedRequest);
-    if(res != UA_STATUSCODE_GOOD)
+    UA_ModifyMonitoredItemsRequest *requestCopy =
+        UA_ModifyMonitoredItemsRequest_new();
+    if(!requestCopy)
+        return UA_STATUSCODE_BADOUTOFMEMORY;
+    UA_StatusCode res =
+        UA_ModifyMonitoredItemsRequest_copy(&request, requestCopy);
+    if(res != UA_STATUSCODE_GOOD) {
+        UA_ModifyMonitoredItemsRequest_delete(requestCopy);
         return res;
+    }
 
     lockClient(client);
+
+    res = __Client_AsyncServiceAdmission(client);
+    if(res != UA_STATUSCODE_GOOD) {
+        unlockClient(client);
+        UA_ModifyMonitoredItemsRequest_delete(requestCopy);
+        return res;
+    }
 
     /* Get the subscription */
     UA_Client_Subscription *sub = findSubscriptionById(client, request.subscriptionId);
     if(!sub) {
         unlockClient(client);
-        UA_ModifyMonitoredItemsRequest_clear(&modifiedRequest);
+        UA_ModifyMonitoredItemsRequest_delete(requestCopy);
         return UA_STATUSCODE_BADSUBSCRIPTIONIDINVALID;
     }
 
-    /* Reuse the existing ClientHandles for the MonitoredItems */
-    setExistingClientHandles(sub, &modifiedRequest);
+    res = MonitoredItems_prepareModify(client, sub, requestCopy);
+    if(res != UA_STATUSCODE_GOOD) {
+        unlockClient(client);
+        UA_ModifyMonitoredItemsRequest_delete(requestCopy);
+        return res;
+    }
+
+    CustomCallback *cc = (CustomCallback*)UA_calloc(1, sizeof(CustomCallback));
+    if(!cc) {
+        MonitoredItems_reconcileModify(sub, requestCopy, NULL);
+        unlockClient(client);
+        UA_ModifyMonitoredItemsRequest_delete(requestCopy);
+        return UA_STATUSCODE_BADOUTOFMEMORY;
+    }
+    cc->clientData = requestCopy;
+    cc->callback.modifyMonitoredItems = callback;
+    cc->userData = userdata;
 
     /* Call the service */
-    UA_StatusCode statusCode = __Client_AsyncService(
-        client, &modifiedRequest, &UA_TYPES[UA_TYPES_MODIFYMONITOREDITEMSREQUEST],
-        (UA_ClientAsyncServiceCallback)callback,
-        &UA_TYPES[UA_TYPES_MODIFYMONITOREDITEMSRESPONSE], userdata, requestId);
+    UA_StatusCode statusCode = __Client_AsyncServiceAdmitted(
+        client, requestCopy, &UA_TYPES[UA_TYPES_MODIFYMONITOREDITEMSREQUEST],
+        MonitoredItems_modify_async_handler,
+        &UA_TYPES[UA_TYPES_MODIFYMONITOREDITEMSRESPONSE], cc, requestId);
+    if(statusCode != UA_STATUSCODE_GOOD) {
+        MonitoredItems_reconcileModify(sub, requestCopy, NULL);
+        UA_ModifyMonitoredItemsRequest_delete(requestCopy);
+        UA_free(cc);
+    }
 
     unlockClient(client);
-
-    /* Clean up */
-    UA_ModifyMonitoredItemsRequest_clear(&modifiedRequest);
     return statusCode;
 }
 
@@ -1294,23 +1435,50 @@ __Client_preparePublishRequest(UA_Client *client, UA_PublishRequest *request) {
     size_t i = 0;
     UA_Client_NotificationsAckNumber *ack_tmp;
     LIST_FOREACH_SAFE(ack, &client->pendingNotificationsAcks, listEntry, ack_tmp) {
-        request->subscriptionAcknowledgements[i].sequenceNumber = ack->subAck.sequenceNumber;
-        request->subscriptionAcknowledgements[i].subscriptionId = ack->subAck.subscriptionId;
-        ++i;
         LIST_REMOVE(ack, listEntry);
+        UA_SubscriptionAcknowledgement *reqAck = &request->subscriptionAcknowledgements[i];
+        reqAck->sequenceNumber = ack->subAck.sequenceNumber;
+        reqAck->subscriptionId = ack->subAck.subscriptionId;
         UA_free(ack);
+        i++;
     }
     return UA_STATUSCODE_GOOD;
 }
 
-/* According to OPC Unified Architecture, Part 4 5.13.1.1 i) */
-/* The value 0 is never used for the sequence number         */
+/* According to specification, Part 4 5.13.1, the value 0 is never used for the
+ * sequence number */
 static UA_UInt32
 __nextSequenceNumber(UA_UInt32 sequenceNumber) {
     UA_UInt32 nextSequenceNumber = sequenceNumber + 1;
     if(nextSequenceNumber == 0)
         nextSequenceNumber = 1;
     return nextSequenceNumber;
+}
+
+static UA_Client_MonitoredItem *
+findMonitoredItemForNotification(UA_Client_Subscription *sub,
+                                 UA_UInt32 clientHandle) {
+    UA_Client_MonitoredItem *mon =
+        findMonitoredItemByHandle(sub, clientHandle);
+    if(mon)
+        return mon;
+
+    /* A notification is the authoritative signal that the server has started
+     * to use the modified settings. Promote the embedded pending slot and
+     * re-key the existing tree node. */
+    mon = (UA_Client_MonitoredItem*)
+        ZIP_ITER(MonitorItemsTree, &sub->monitoredItems,
+                 MonitoredItem_findPendingByHandle, &clientHandle);
+    if(!mon)
+        return NULL;
+
+    ZIP_REMOVE(MonitorItemsTree, &sub->monitoredItems, mon);
+    UA_MonitoringParameters_clear(&mon->parameters);
+    mon->parameters = mon->pendingParameters;
+    UA_MonitoringParameters_init(&mon->pendingParameters);
+    EventFields_clear(&mon->eventFields);
+    ZIP_INSERT(MonitorItemsTree, &sub->monitoredItems, mon);
+    return mon;
 }
 
 static void
@@ -1322,10 +1490,8 @@ processDataChangeNotification(UA_Client *client, UA_Client_Subscription *sub,
         UA_MonitoredItemNotification *min = &dataChangeNotification->monitoredItems[j];
 
         /* Find the MonitoredItem */
-        UA_Client_MonitoredItem *mon;
-        UA_Client_MonitoredItem dummy;
-        dummy.clientHandle = min->clientHandle;
-        mon = ZIP_FIND(MonitorItemsTree, &sub->monitoredItems, &dummy);
+        UA_Client_MonitoredItem *mon =
+            findMonitoredItemForNotification(sub, min->clientHandle);
 
         if(!mon) {
             UA_LOG_WARNING(client->config.logging, UA_LOGCATEGORY_CLIENT,
@@ -1360,10 +1526,8 @@ processEventNotification(UA_Client *client, UA_Client_Subscription *sub,
         UA_EventFieldList *efl = &eventNotificationList->events[j];
 
         /* Find the MonitoredItem */
-        UA_Client_MonitoredItem *mon;
-        UA_Client_MonitoredItem dummy;
-        dummy.clientHandle = efl->clientHandle;
-        mon = ZIP_FIND(MonitorItemsTree, &sub->monitoredItems, &dummy);
+        UA_Client_MonitoredItem *mon =
+            findMonitoredItemForNotification(sub, efl->clientHandle);
 
         if(!mon) {
             UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
@@ -1380,6 +1544,21 @@ processEventNotification(UA_Client *client, UA_Client_Subscription *sub,
             continue;
         }
 
+        /* Build the callback metadata from the active filter only when it is
+         * first needed. After a promotion the cache is empty and rebuilt from
+         * the newly active parameters. */
+        if(mon->eventFields.mapSize == 0) {
+            UA_StatusCode res =
+                prepareEventFieldsMap(&mon->eventFields, &mon->parameters);
+            if(res != UA_STATUSCODE_GOOD) {
+                EventFields_clear(&mon->eventFields);
+                UA_LOG_WARNING(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                               "Could not prepare event fields: %s",
+                               UA_StatusCode_name(res));
+                continue;
+            }
+        }
+
         if(mon->eventFields.mapSize != efl->eventFieldsSize) {
             UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                          "MonitoredItem received a EventNotification with the "
@@ -1387,12 +1566,12 @@ processEventNotification(UA_Client *client, UA_Client_Subscription *sub,
             continue;
         }
 
-        /* Prepare the key-value map and call the callback  */
-        for(size_t i = 0; i < mon->eventFields.mapSize; i++) {
+        /* Add the borrowed notification values to the cached field names. */
+        for(size_t i = 0; i < mon->eventFields.mapSize; i++)
             mon->eventFields.map[i].value = efl->eventFields[i];
-        }
         mon->handler.eventCallback(client, sub->subscriptionId, sub->context,
-                                   mon->monitoredItemId, mon->context, mon->eventFields);
+                                   mon->monitoredItemId, mon->context,
+                                   mon->eventFields);
     }
 }
 
@@ -1439,109 +1618,121 @@ processNotificationMessage(UA_Client *client, UA_Client_Subscription *sub,
                    "Unknown notification message type");
 }
 
-static void
+void
 __Client_Subscriptions_processPublishResponse(UA_Client *client, UA_PublishRequest *request,
                                               UA_PublishResponse *response) {
     UA_LOCK_ASSERT(&client->clientMutex);
 
-    UA_NotificationMessage *msg = &response->notificationMessage;
-
+    /* Reduce the number of "in-flight" PublishRequests */
     client->currentlyOutStandingPublishRequests--;
 
-    if(response->responseHeader.serviceResult == UA_STATUSCODE_BADTOOMANYPUBLISHREQUESTS) {
+    /* Process ServiceResult for bad StatusCodes without referring to a
+     * SubscriptionId */
+    switch(response->responseHeader.serviceResult) {
+    case UA_STATUSCODE_BADTOOMANYPUBLISHREQUESTS:
+        /* Correct the assumed number of max outstanding requests */
         if(client->config.outStandingPublishRequests > 1) {
             client->config.outStandingPublishRequests--;
             UA_LOG_WARNING(client->config.logging, UA_LOGCATEGORY_CLIENT,
-                           "Too many publishrequest, reduce outStandingPublishRequests "
-                           "to %" PRId16, client->config.outStandingPublishRequests);
+                           "PublishResponse: Too many PublishRequest, reduce "
+                           "outStandingPublishRequests to %" PRId16,
+                           client->config.outStandingPublishRequests);
         } else {
-            UA_LOG_WARNING(client->config.logging, UA_LOGCATEGORY_CLIENT,
-                           "Too many publishrequest when outStandingPublishRequests = 1");
+            UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                         "PublishResponse: Too many PublishRequests when "
+                         "outStandingPublishRequests = 1");
             UA_Client_Subscriptions_deleteSingle(client, response->subscriptionId);
         }
         return;
-    }
 
-    if(response->responseHeader.serviceResult == UA_STATUSCODE_BADSHUTDOWN)
+    case UA_STATUSCODE_BADSHUTDOWN:
+        /* If the remote server shuts down, DEBUG-log to avoid a warning-storm
+         * for normal operations */
+        UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                     "PublishResponse: Received BadShutdown status");
         return;
 
-    if(response->responseHeader.serviceResult == UA_STATUSCODE_BADNOSUBSCRIPTION) {
-        UA_LOG_WARNING(client->config.logging, UA_LOGCATEGORY_CLIENT,
-                       "Received BadNoSubscription, delete internal information about subscription");
-        UA_Client_Subscription *sub = findSubscriptionById(client, response->subscriptionId);
-        if(sub != NULL)
-            __Client_Subscription_deleteInternal(client, sub);
+    case UA_STATUSCODE_BADNOSUBSCRIPTION:
+        /* There is no Subscription configured, the server expects no
+         * PublishRequests. We demote this to debug-logging, as it can occur
+         * during regular shutdown when the Subscriptions are removed. */
+        UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                     "PublishResponse: Received BadNoSubscription status");
         return;
+
+    default:
+        break;
     }
 
-    if(!LIST_FIRST(&client->subscriptions)) {
-        response->responseHeader.serviceResult = UA_STATUSCODE_BADNOSUBSCRIPTION;
-        return;
-    }
-
+    /* Get the Subscription */
     UA_Client_Subscription *sub = findSubscriptionById(client, response->subscriptionId);
     if(!sub) {
-        response->responseHeader.serviceResult = UA_STATUSCODE_BADINTERNALERROR;
+        response->responseHeader.serviceResult = UA_STATUSCODE_BADNOSUBSCRIPTION;
         UA_LOG_WARNING(client->config.logging, UA_LOGCATEGORY_CLIENT,
-                       "Received Publish Response for a non-existant subscription");
+                       "PublishResponse: Received response for an unknown Subscription");
         return;
     }
 
-    if(response->responseHeader.serviceResult == UA_STATUSCODE_BADSESSIONCLOSED) {
-        if(client->sessionState != UA_SESSIONSTATE_ACTIVATED) {
-            UA_LOG_WARNING(client->config.logging, UA_LOGCATEGORY_CLIENT,
-                           "Received Publish Response with code %s",
-                           UA_StatusCode_name(response->responseHeader.serviceResult));
-            __Client_Subscription_deleteInternal(client, sub);
-        }
+    /* Process ServiceResult */
+    switch(response->responseHeader.serviceResult) {
+    case UA_STATUSCODE_BADSESSIONCLOSED:
+        /* The Session no longer exists on the server - remove the Subscription */
+        __Client_Subscription_deleteInternal(client, sub);
         return;
-    }
 
-    if(response->responseHeader.serviceResult == UA_STATUSCODE_BADTIMEOUT) {
+    case UA_STATUSCODE_BADTIMEOUT:
+        UA_LOG_WARNING(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                       "PublishResponse: Aborted with BadTimeout status");
         if(client->config.subscriptionInactivityCallback) {
             void *subC = sub->context;
             UA_UInt32 subId = sub->subscriptionId;
             client->config.subscriptionInactivityCallback(client, subId, subC);
         }
-        UA_LOG_WARNING(client->config.logging, UA_LOGCATEGORY_CLIENT,
-                       "Received Timeout for Publish Response");
         return;
-    }
 
-    if(response->responseHeader.serviceResult != UA_STATUSCODE_GOOD) {
+    case UA_STATUSCODE_GOOD:
+        break; /* Continue below */
+
+    default:
+        /* Catch-all for other bad StatusCodes */
         UA_LOG_WARNING(client->config.logging, UA_LOGCATEGORY_CLIENT,
-                       "Received Publish Response with code %s",
+                       "PublishResponse: Received %s status",
                        UA_StatusCode_name(response->responseHeader.serviceResult));
         return;
     }
 
+    /* Update the LastActivity for the Subscription */
     UA_EventLoop *el = client->config.eventLoop;
     sub->lastActivity = el->dateTime_nowMonotonic(el);
 
     /* Detect missing message - OPC Unified Architecture, Part 4 5.13.1.1 e) */
+    UA_NotificationMessage *msg = &response->notificationMessage;
     if(__nextSequenceNumber(sub->sequenceNumber) != msg->sequenceNumber) {
         UA_LOG_WARNING(client->config.logging, UA_LOGCATEGORY_CLIENT,
-                       "Invalid subscription sequence number: expected %" PRIu32
-                       " but got %" PRIu32, __nextSequenceNumber(sub->sequenceNumber),
-                       msg->sequenceNumber);
+                       "PublishResponse: Invalid subscription sequence number: "
+                       "Expected %" PRIu32 " but got %" PRIu32,
+                       __nextSequenceNumber(sub->sequenceNumber), msg->sequenceNumber);
         /* This is an error. But we do not abort the connection. Some server
          * SDKs misbehave from time to time and send out-of-order sequence
          * numbers. (Probably some multi-threading synchronization issue.) */
         /* UA_Client_disconnect(client);
            return; */
     }
+
     /* According to f), a keep-alive message contains no notifications and has
      * the sequence number of the next NotificationMessage that is to be sent =>
      * More than one consecutive keep-alive message or a NotificationMessage
      * following a keep-alive message will share the same sequence number. */
-    if (msg->notificationDataSize)
+    if(msg->notificationDataSize)
         sub->sequenceNumber = msg->sequenceNumber;
 
     /* Process the notification messages */
     for(size_t k = 0; k < msg->notificationDataSize; ++k)
         processNotificationMessage(client, sub, &msg->notificationData[k]);
 
-    /* Add to the list of pending acks */
+    /* Add the current NotificationMessage (SequenceNumber) to the list of
+     * pending acks to be acknowledged. But only if it is in the list of
+     * sequence numbers the server has available. */
     for(size_t i = 0; i < response->availableSequenceNumbersSize; i++) {
         if(response->availableSequenceNumbers[i] != msg->sequenceNumber)
             continue;
@@ -1549,8 +1740,8 @@ __Client_Subscriptions_processPublishResponse(UA_Client *client, UA_PublishReque
             UA_malloc(sizeof(UA_Client_NotificationsAckNumber));
         if(!tmpAck) {
             UA_LOG_WARNING(client->config.logging, UA_LOGCATEGORY_CLIENT,
-                           "Not enough memory to store the acknowledgement for a publish "
-                           "message on subscription %" PRIu32, sub->subscriptionId);
+                           "PublishResponse: Not enough memory to store the pending "
+                           "acknowledgement for Subscription %" PRIu32, sub->subscriptionId);
             break;
         }
         tmpAck->subAck.sequenceNumber = msg->sequenceNumber;
@@ -1619,7 +1810,8 @@ __Client_Subscriptions_backgroundPublishInactivityCheck(UA_Client *client) {
                 client->config.subscriptionInactivityCallback(client, subId, subC);
             }
             UA_LOG_WARNING(client->config.logging, UA_LOGCATEGORY_CLIENT,
-                           "Inactivity for Subscription %" PRIu32 ".", sub->subscriptionId);
+                           "Inactivity for Subscription %" PRIu32 ".",
+                           sub->subscriptionId);
         }
     }
 }
@@ -1649,7 +1841,7 @@ __Client_Subscriptions_backgroundPublish(UA_Client *client) {
             return;
         }
 
-        retval = __Client_AsyncService(client, request,
+        retval = __Client_AsyncServiceInternal(client, request,
                                          &UA_TYPES[UA_TYPES_PUBLISHREQUEST],
                                          processPublishResponseAsync,
                                          &UA_TYPES[UA_TYPES_PUBLISHRESPONSE],
@@ -1681,16 +1873,33 @@ UA_Client_MonitoredItems_setMonitoringMode(UA_Client *client,
     return response;
 }
 
+static void
+MonitoredItems_setMonitoringMode_async_handler(UA_Client *client, void *userdata,
+                                               UA_UInt32 requestId, void *response) {
+    UA_AsyncCallbackContext *ctx = (UA_AsyncCallbackContext*)userdata;
+    if(ctx->callback.setMonitoringMode)
+        ctx->callback.setMonitoringMode(
+            client, ctx->userdata, requestId,
+            (UA_SetMonitoringModeResponse*)response);
+}
+
 UA_StatusCode
 UA_Client_MonitoredItems_setMonitoringMode_async(UA_Client *client,
                                                  const UA_SetMonitoringModeRequest request,
                                                  UA_ClientAsyncSetMonitoringModeCallback callback,
                                                  void *userdata, UA_UInt32 *requestId) {
-    return __UA_Client_AsyncService(client, &request,
-                                    &UA_TYPES[UA_TYPES_SETMONITORINGMODEREQUEST],
-                                    (UA_ClientAsyncServiceCallback)callback,
-                                    &UA_TYPES[UA_TYPES_SETMONITORINGMODERESPONSE],
-                                    userdata, requestId);
+    UA_AsyncCallbackContext ctx;
+    UA_StatusCode res;
+    ctx.callback.setMonitoringMode = callback;
+    ctx.userdata = userdata;
+    ctx.resultType = NULL;
+    lockClient(client);
+    res = __Client_AsyncServiceWithContext(
+        client, &request, &UA_TYPES[UA_TYPES_SETMONITORINGMODEREQUEST],
+        MonitoredItems_setMonitoringMode_async_handler,
+        &UA_TYPES[UA_TYPES_SETMONITORINGMODERESPONSE], NULL, &ctx, requestId);
+    unlockClient(client);
+    return res;
 }
 
 UA_SetTriggeringResponse
@@ -1702,14 +1911,31 @@ UA_Client_MonitoredItems_setTriggering(UA_Client *client,
     return response;
 }
 
+static void
+MonitoredItems_setTriggering_async_handler(UA_Client *client, void *userdata,
+                                           UA_UInt32 requestId, void *response) {
+    UA_AsyncCallbackContext *ctx = (UA_AsyncCallbackContext*)userdata;
+    if(ctx->callback.setTriggering)
+        ctx->callback.setTriggering(
+            client, ctx->userdata, requestId,
+            (UA_SetTriggeringResponse*)response);
+}
+
 UA_StatusCode
 UA_Client_MonitoredItems_setTriggering_async(UA_Client *client,
                                              const UA_SetTriggeringRequest request,
                                              UA_ClientAsyncSetTriggeringCallback callback,
                                              void *userdata, UA_UInt32 *requestId) {
-    return __UA_Client_AsyncService(client, &request,
-                                    &UA_TYPES[UA_TYPES_SETTRIGGERINGREQUEST],
-                                    (UA_ClientAsyncServiceCallback)callback,
-                                    &UA_TYPES[UA_TYPES_SETTRIGGERINGRESPONSE],
-                                    userdata, requestId);
+    UA_AsyncCallbackContext ctx;
+    UA_StatusCode res;
+    ctx.callback.setTriggering = callback;
+    ctx.userdata = userdata;
+    ctx.resultType = NULL;
+    lockClient(client);
+    res = __Client_AsyncServiceWithContext(
+        client, &request, &UA_TYPES[UA_TYPES_SETTRIGGERINGREQUEST],
+        MonitoredItems_setTriggering_async_handler,
+        &UA_TYPES[UA_TYPES_SETTRIGGERINGRESPONSE], NULL, &ctx, requestId);
+    unlockClient(client);
+    return res;
 }

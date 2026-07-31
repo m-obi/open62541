@@ -17,11 +17,18 @@
  *    Copyright 2017-2020 (c) HMS Industrial Networks AB (Author: Jonas Green)
  *    Copyright 2017 (c) Henrik Norrman
  *    Copyright 2020 (c) Christian von Arnim, ISW University of Stuttgart  (for VDW and umati)
+ *    Copyright 2026 (c) o6 Automation GmbH (Author: Julius Pfrommer)
+ *    Copyright 2026 (c) o6 Automation GmbH (Author: Andreas Ebner)
+ *    Copyright 2026 (c) Precitec GmbH & Co. KG (Author: Eric Supernok)
  */
 
 #include "ua_server_internal.h"
 #include "../ua_types_encoding_binary.h"
 #include "ua_services.h"
+
+#ifdef UA_ENABLE_RBAC
+#include "ua_server_rbac.h"
+#endif
 
 #ifdef UA_ENABLE_HISTORIZING
 #include <open62541/plugin/historydatabase.h>
@@ -82,6 +89,14 @@ getUserWriteMask(UA_Server *server, const UA_Session *session,
                           session ? &session->sessionId : NULL,
                           session ? session->context : NULL,
                           &head->nodeId, head->context);
+}
+
+static UA_Byte
+getAccessLevel(UA_Server *server, const UA_Session *session,
+               const UA_VariableNode *node) {
+    if(session == &server->adminSession)
+        return 0xFF; /* the local admin user has all rights */
+    return node->accessLevel;
 }
 
 static UA_Byte
@@ -176,12 +191,8 @@ readUserRolePermissions(UA_Server *server, UA_Session *session,
         server, &session->sessionId, &node->head.nodeId,
         &entriesSize, &entries);
 
-    if(retval != UA_STATUSCODE_GOOD) {
-        /* On error, return empty array (fail open for compatibility) */
-        UA_Variant_setArray(&v->value, NULL, 0,
-                           &UA_TYPES[UA_TYPES_ROLEPERMISSIONTYPE]);
-        return UA_STATUSCODE_GOOD;
-    }
+    if(retval != UA_STATUSCODE_GOOD)
+        return retval;
 
     UA_Variant_setArray(&v->value, entries, entriesSize,
                        &UA_TYPES[UA_TYPES_ROLEPERMISSIONTYPE]);
@@ -258,8 +269,7 @@ readExternalValueAttribute(UA_Server *server, UA_Session *session,
                    vn->head.context, rangeptr, *vn->valueSource.external.value);
 
     /* Reload the value pointer */
-    const UA_DataValue *val = (const UA_DataValue*)
-        UA_atomic_load((void**)vn->valueSource.external.value);
+    const UA_DataValue *val = UA_atomic_load(vn->valueSource.external.value);
 
     /* Set the result */
     return (!rangeptr) ? UA_DataValue_copy(val, v) : UA_DataValue_copyRange(val, v, *rangeptr);
@@ -289,6 +299,26 @@ readCallbackValueAttribute(UA_Server *server, UA_Session *session,
         *v = v2;
     }
     return retval;
+}
+
+/* OPC UA Part 6: Non-nullable built-in types are Boolean and the 
+ * numeric types (SByte..Double), StatusCode and Enumerations.
+ * All remaining built-in types are nullable. */
+static bool
+isNullableDataType(UA_Server *server, const UA_NodeId *dataType) {
+    const UA_DataType *type = UA_Server_findDataType(server, dataType);
+    if(!type)
+        return true; /* Unknown type */
+    if(UA_DataType_isNumeric(type))
+        return false;
+    switch(type->typeKind) {
+        case UA_DATATYPEKIND_BOOLEAN:
+        case UA_DATATYPEKIND_STATUSCODE:
+        case UA_DATATYPEKIND_ENUM:
+            return false;
+        default:
+            return true;
+    }
 }
 
 static UA_StatusCode
@@ -354,6 +384,132 @@ static const UA_String jsonEncoding = {sizeof("Default JSON")-1, (UA_Byte*)"Defa
         break;                                                  \
     }
 
+static void
+addMissingTimestamps(UA_Server *server, UA_DataValue *v,
+              UA_TimestampsToReturn timestampsToReturn,
+              const UA_ReadValueId *id) {
+    /* Always use the current time as the server-timestamp */
+    if(timestampsToReturn == UA_TIMESTAMPSTORETURN_SERVER ||
+       timestampsToReturn == UA_TIMESTAMPSTORETURN_BOTH) {
+        UA_EventLoop *el = server->config.eventLoop;
+        v->serverTimestamp = el->dateTime_now(el);
+        v->hasServerTimestamp = true;
+        v->hasServerPicoseconds = false;
+    } else {
+        v->hasServerTimestamp = false;
+        v->hasServerPicoseconds = false;
+    }
+
+    /* Remove source timestamps when not required */
+    if(timestampsToReturn == UA_TIMESTAMPSTORETURN_SERVER ||
+       timestampsToReturn == UA_TIMESTAMPSTORETURN_NEITHER) {
+        v->hasSourceTimestamp = false;
+        v->hasSourcePicoseconds = false;
+    } else if(timestampsToReturn == UA_TIMESTAMPSTORETURN_SOURCE ||
+              timestampsToReturn == UA_TIMESTAMPSTORETURN_BOTH) {
+        /* Optional behavior and not required by the specification: Always
+         * set a SourceTimestamp for the value attribute, even if the value
+         * source didn't return one. */
+        if(!v->hasSourceTimestamp && id->attributeId == UA_ATTRIBUTEID_VALUE) {
+            UA_EventLoop *el = server->config.eventLoop;
+            v->sourceTimestamp = el->dateTime_now(el);
+            v->hasSourceTimestamp = true;
+            v->hasSourcePicoseconds = false;
+        }
+    }
+}
+
+#ifdef UA_ENABLE_TYPEDESCRIPTION
+/* Status codes meaning the optional property is absent: fall through to the
+ * next candidate instead of failing. */
+static UA_Boolean
+enumPropertyMissing(UA_StatusCode s) {
+    return s == UA_STATUSCODE_BADNOMATCH ||
+           s == UA_STATUSCODE_BADNOTFOUND ||
+           s == UA_STATUSCODE_BADNODEIDUNKNOWN;
+}
+
+/* Build the EnumDefinition of a member-less Enumeration DataType from its
+ * EnumValues or EnumStrings property (OPC UA Part 3 v1.05, 5.8.3). BadNotFound
+ * if neither exists. Reads via adminSession, like the compiled-enum path. */
+static UA_StatusCode
+buildEnumDefinitionFromProperties(UA_Server *server, const UA_NodeId *dataTypeId,
+                                  UA_EnumDefinition *def) {
+    UA_LOCK_ASSERT(&server->serviceMutex);
+    UA_EnumDefinition_init(def);
+
+    UA_StatusCode res = UA_STATUSCODE_GOOD;
+    UA_Variant v;
+    UA_Variant_init(&v);
+
+    /* Prefer the EnumValues property (explicit values) */
+    UA_StatusCode found =
+        readObjectProperty(server, *dataTypeId,
+                           UA_QUALIFIEDNAME(0, "EnumValues"), &v);
+    if(!enumPropertyMissing(found) && found != UA_STATUSCODE_GOOD) {
+        res = found; /* Genuine read error, propagate */
+        goto out;
+    }
+    if(UA_Variant_hasArrayType(&v, &UA_TYPES[UA_TYPES_ENUMVALUETYPE]) &&
+       v.arrayLength > 0) {
+        def->fields = (UA_EnumField*)
+            UA_Array_new(v.arrayLength, &UA_TYPES[UA_TYPES_ENUMFIELD]);
+        if(!def->fields) {
+            res = UA_STATUSCODE_BADOUTOFMEMORY;
+            goto out;
+        }
+        def->fieldsSize = v.arrayLength;
+        const UA_EnumValueType *ev = (const UA_EnumValueType*)v.data;
+        for(size_t i = 0; i < v.arrayLength && res == UA_STATUSCODE_GOOD; i++) {
+            UA_EnumField *f = &def->fields[i];
+            f->value = ev[i].value;
+            res = UA_String_copy(&ev[i].displayName.text, &f->name);
+            if(res == UA_STATUSCODE_GOOD)
+                res = UA_LocalizedText_copy(&ev[i].displayName, &f->displayName);
+            if(res == UA_STATUSCODE_GOOD)
+                res = UA_LocalizedText_copy(&ev[i].description, &f->description);
+        }
+        goto out;
+    }
+
+    /* Fall back to the EnumStrings property (implicit values 0..n-1) */
+    UA_Variant_clear(&v);
+    found = readObjectProperty(server, *dataTypeId,
+                               UA_QUALIFIEDNAME(0, "EnumStrings"), &v);
+    if(!enumPropertyMissing(found) && found != UA_STATUSCODE_GOOD) {
+        res = found; /* Genuine read error, propagate */
+        goto out;
+    }
+    if(UA_Variant_hasArrayType(&v, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]) &&
+       v.arrayLength > 0) {
+        def->fields = (UA_EnumField*)
+            UA_Array_new(v.arrayLength, &UA_TYPES[UA_TYPES_ENUMFIELD]);
+        if(!def->fields) {
+            res = UA_STATUSCODE_BADOUTOFMEMORY;
+            goto out;
+        }
+        def->fieldsSize = v.arrayLength;
+        const UA_LocalizedText *lt = (const UA_LocalizedText*)v.data;
+        for(size_t i = 0; i < v.arrayLength && res == UA_STATUSCODE_GOOD; i++) {
+            UA_EnumField *f = &def->fields[i];
+            f->value = (UA_Int64)i;
+            res = UA_String_copy(&lt[i].text, &f->name);
+            if(res == UA_STATUSCODE_GOOD)
+                res = UA_LocalizedText_copy(&lt[i], &f->displayName);
+        }
+        goto out;
+    }
+
+    res = UA_STATUSCODE_BADNOTFOUND; /* Neither property present */
+
+ out:
+    UA_Variant_clear(&v);
+    if(res != UA_STATUSCODE_GOOD)
+        UA_EnumDefinition_clear(def);
+    return res;
+}
+#endif
+
 /* Returns whether the operation is done or an async operation has been
  * triggered. */
 static UA_Boolean
@@ -373,6 +529,7 @@ ReadWithNodeMaybeAsync(const UA_Node *node, UA_Server *server, UA_Session *sessi
         else
            v->status = UA_STATUSCODE_BADDATAENCODINGINVALID;
         v->hasStatus = true;
+        addMissingTimestamps(server, v, timestampsToReturn, id);
         return true;
     }
 
@@ -380,6 +537,7 @@ ReadWithNodeMaybeAsync(const UA_Node *node, UA_Server *server, UA_Session *sessi
     if(id->indexRange.length > 0 && id->attributeId != UA_ATTRIBUTEID_VALUE) {
         v->hasStatus = true;
         v->status = UA_STATUSCODE_BADINDEXRANGENODATA;
+        addMissingTimestamps(server, v, timestampsToReturn, id);
         return true;
     }
 
@@ -556,17 +714,44 @@ ReadWithNodeMaybeAsync(const UA_Node *node, UA_Server *server, UA_Session *sessi
             UA_QualifiedName_clear(&sd->name);
             memmove(sd, &sd->structureDefinition, sizeof(UA_StructureDefinition));
             UA_Variant_setScalar(&v->value, sd, &UA_TYPES[UA_TYPES_STRUCTUREDEFINITION]);
-        } else if(typeDescr.content.decoded.type == &UA_TYPES[UA_TYPES_ENUMDESCRIPTION] && type->membersSize > 0) {
-            /* UaExpert doesn't fall back to the EnumStrings property if the DataTypeDefinition attribute
-               can be read but has no fields. This breaks its method call dialog for enum parameters. */
+            UA_ExtensionObject_init(&typeDescr); /* Ownership moved to the Variant */
+        } else if(typeDescr.content.decoded.type == &UA_TYPES[UA_TYPES_ENUMDESCRIPTION]) {
+            if(type->membersSize > 0) {
+                /* UaExpert doesn't fall back to the EnumStrings property if the DataTypeDefinition attribute
+                   can be read but has no fields. This breaks its method call dialog for enum parameters. */
 
-            UA_EnumDescription *ed = (UA_EnumDescription*)
-                typeDescr.content.decoded.data;
-            UA_NodeId_clear(&ed->dataTypeId);
-            UA_QualifiedName_clear(&ed->name);
-            memmove(ed, &ed->enumDefinition, sizeof(UA_EnumDefinition));
-            UA_Variant_setScalar(&v->value, ed, &UA_TYPES[UA_TYPES_ENUMDEFINITION]);
+                UA_EnumDescription *ed = (UA_EnumDescription*)
+                    typeDescr.content.decoded.data;
+                UA_NodeId_clear(&ed->dataTypeId);
+                UA_QualifiedName_clear(&ed->name);
+                memmove(ed, &ed->enumDefinition, sizeof(UA_EnumDefinition));
+                UA_Variant_setScalar(&v->value, ed, &UA_TYPES[UA_TYPES_ENUMDEFINITION]);
+                UA_ExtensionObject_init(&typeDescr); /* Ownership moved to the Variant */
+            } else {
+                /* No compiled members: build from the EnumValues/EnumStrings
+                 * property (OPC UA Part 3 v1.05, Section 5.8.3) */
+                UA_ExtensionObject_clear(&typeDescr);
+                UA_EnumDefinition *enumDef = UA_EnumDefinition_new();
+                if(!enumDef) {
+                    retval = UA_STATUSCODE_BADOUTOFMEMORY;
+                    break;
+                }
+                UA_StatusCode res =
+                    buildEnumDefinitionFromProperties(server, &node->head.nodeId,
+                                                      enumDef);
+                if(res != UA_STATUSCODE_GOOD) {
+                    UA_EnumDefinition_delete(enumDef);
+                    /* No property: BadAttributeIdInvalid; else propagate */
+                    retval = (res == UA_STATUSCODE_BADNOTFOUND) ?
+                        UA_STATUSCODE_BADATTRIBUTEIDINVALID : res;
+                    break;
+                }
+                UA_Variant_setScalar(&v->value, enumDef,
+                                     &UA_TYPES[UA_TYPES_ENUMDEFINITION]);
+            }
         } else {
+            /* E.g. SimpleTypeDescription: no DataTypeDefinition encoding */
+            UA_ExtensionObject_clear(&typeDescr);
             retval = UA_STATUSCODE_BADATTRIBUTEIDINVALID;
         }
 #else
@@ -611,24 +796,21 @@ ReadWithNodeMaybeAsync(const UA_Node *node, UA_Server *server, UA_Session *sessi
         v->status = retval;
     }
 
-    /* Always use the current time as the server-timestamp */
-    if(timestampsToReturn == UA_TIMESTAMPSTORETURN_SERVER ||
-       timestampsToReturn == UA_TIMESTAMPSTORETURN_BOTH) {
-        UA_EventLoop *el = server->config.eventLoop;
-        v->serverTimestamp = el->dateTime_now(el);
-        v->hasServerTimestamp = true;
-        v->hasServerPicoseconds = false;
-    } else {
-        v->hasServerTimestamp = false;
-        v->hasServerPicoseconds = false;
+    /* OPC UA Part 4:  StatusCode Good is only permitted for nullable
+     * DataTypes. Non-nullable must have a Bad StatusCode
+     * when no value is available. Only apply this check if no other
+     * error has occurred. */
+    if(retval == UA_STATUSCODE_GOOD &&
+       v->hasValue && UA_Variant_isEmpty(&v->value) &&
+       (node->head.nodeClass == UA_NODECLASS_VARIABLE ||
+        node->head.nodeClass == UA_NODECLASS_VARIABLETYPE) &&
+       !isNullableDataType(server, &node->variableNode.dataType)) {
+        v->hasValue = false;
+        v->hasStatus = true;
+        v->status = UA_STATUSCODE_BADWAITINGFORINITIALDATA;
     }
 
-    /* Don't "invent" source timestamps. But remove them when not required. */
-    if(timestampsToReturn == UA_TIMESTAMPSTORETURN_SERVER ||
-       timestampsToReturn == UA_TIMESTAMPSTORETURN_NEITHER) {
-        v->hasSourceTimestamp = false;
-        v->hasSourcePicoseconds = false;
-    }
+    addMissingTimestamps(server, v, timestampsToReturn, id);
 
     /* Are we done or is this an async read? */
     return (retval != UA_STATUSCODE_GOODCOMPLETESASYNCHRONOUSLY);
@@ -978,6 +1160,9 @@ compatibleValueRankArrayDimensions(UA_Server *server, UA_Session *session,
 
 UA_Boolean
 compatibleValueRanks(UA_Int32 valueRank, UA_Int32 constraintValueRank) {
+    if(valueRank == constraintValueRank)
+        return true;
+
     /* Check if the valuerank of the variabletype allows the change. */
     switch(constraintValueRank) {
     case UA_VALUERANK_SCALAR_OR_ONE_DIMENSION: /* the value can be a scalar or a
@@ -1406,7 +1591,7 @@ static UA_StatusCode
 writeInternalValueAttribute(UA_DataValue *oldValue,
                             const UA_DataValue *value,
                             const UA_NumericRange *rangeptr) {
-    UA_StatusCode retval = UA_STATUSCODE_GOOD;
+    /* Overwrite only a sub-range in the (multi-dimensional) array */
     if(rangeptr) {
         /* Value on both sides? */
         if(value->status != oldValue->status || !value->hasValue || !oldValue->hasValue)
@@ -1427,10 +1612,10 @@ writeInternalValueAttribute(UA_DataValue *oldValue,
             return UA_STATUSCODE_BADTYPEMISMATCH;
 
         /* Write the value */
-        retval = UA_Variant_setRangeCopy(&oldValue->value, v->data,
-                                         v->arrayLength, *rangeptr);
-        if(retval != UA_STATUSCODE_GOOD)
-            return retval;
+        UA_StatusCode res =
+            UA_Variant_setRangeCopy(&oldValue->value, v->data, v->arrayLength, *rangeptr);
+        if(res != UA_STATUSCODE_GOOD)
+            return res;
 
         /* Write the status and timestamps */
         oldValue->hasStatus = value->hasStatus;
@@ -1439,51 +1624,10 @@ writeInternalValueAttribute(UA_DataValue *oldValue,
         oldValue->sourceTimestamp = value->sourceTimestamp;
         oldValue->hasSourcePicoseconds = value->hasSourcePicoseconds;
         oldValue->sourcePicoseconds = value->sourcePicoseconds;
-    } else {
-        UA_DataValue tmpValue = *value;
-
-        /* If possible memcpy the new value over the old value without
-         * a malloc. For this the value needs to be "pointerfree". */
-        if(oldValue->hasValue && oldValue->value.type &&
-           oldValue->value.type->pointerFree && value->hasValue &&
-           value->value.type && value->value.type->pointerFree &&
-           oldValue->value.type->memSize == value->value.type->memSize) {
-            size_t oSize = 1;
-            size_t vSize = 1;
-            if(!UA_Variant_isScalar(&oldValue->value))
-                oSize = oldValue->value.arrayLength;
-            if(!UA_Variant_isScalar(&value->value))
-                vSize = value->value.arrayLength;
-
-            if(oSize == vSize &&
-               oldValue->value.arrayDimensionsSize == value->value.arrayDimensionsSize) {
-                /* Keep the old pointers, but adjust type and array length */
-                tmpValue.value = oldValue->value;
-                tmpValue.value.type = value->value.type;
-                tmpValue.value.arrayLength = value->value.arrayLength;
-
-                /* Copy the data over the old memory */
-                memcpy(tmpValue.value.data, value->value.data,
-                       oSize * oldValue->value.type->memSize);
-                if(oldValue->value.arrayDimensionsSize > 0) /* No memcpy with NULL-ptr */
-                    memcpy(tmpValue.value.arrayDimensions, value->value.arrayDimensions,
-                           sizeof(UA_UInt32) * oldValue->value.arrayDimensionsSize);
-
-                /* Set the value */
-                *oldValue = tmpValue;
-                return UA_STATUSCODE_GOOD;
-            }
-        }
-
-        /* Make a deep copy of the value and replace when this succeeds */
-        retval = UA_Variant_copy(&value->value, &tmpValue.value);
-        if(retval != UA_STATUSCODE_GOOD)
-            return retval;
-        UA_DataValue_clear(oldValue);
-        *oldValue = tmpValue;
+        return UA_STATUSCODE_GOOD;
     }
 
-    return retval;
+    return UA_replace(oldValue, value, &UA_TYPES[UA_TYPES_DATAVALUE]);
 }
 
 static UA_StatusCode
@@ -1534,6 +1678,16 @@ writeNodeValueAttribute(UA_Server *server, UA_Session *session,
                 UA_free(rangeptr->dimensions);
             return UA_STATUSCODE_BADTYPEMISMATCH;
         }
+    /* Reject writing a null/empty value for non-nullable data types.
+     * OPC UA Part 6, Table 1 defines which built-in types are non-nullable
+     * (Boolean, numeric, StatusCode, enumerations). Part 4, 7.11.5 states:
+     * "the Severity shall be BAD if the value is NULL for a non-nullable
+     * Datatype". Without this check the node is left in a state that returns
+     * BadWaitingForInitialData on subsequent reads. */
+    } else if(!isNullableDataType(server, &node->dataType)) {
+        if(rangeptr && rangeptr->dimensions != NULL)
+            UA_free(rangeptr->dimensions);
+        return UA_STATUSCODE_BADTYPEMISMATCH;
     }
 
     /* If no source timestamp is defined create one here.
@@ -1549,8 +1703,7 @@ writeNodeValueAttribute(UA_Server *server, UA_Session *session,
     case UA_VALUESOURCETYPE_EXTERNAL:
     case UA_VALUESOURCETYPE_INTERNAL: {
         UA_DataValue *oldValue = (node->valueSourceType == UA_VALUESOURCETYPE_INTERNAL) ?
-            &node->valueSource.internal.value :
-            (UA_DataValue*)UA_atomic_load((void**)node->valueSource.external.value);
+            &node->valueSource.internal.value : UA_atomic_load(node->valueSource.external.value);
         retval = writeInternalValueAttribute(oldValue, &adjustedValue, rangeptr);
         if(retval == UA_STATUSCODE_GOOD &&
            node->valueSource.internal.notifications.onWrite)
@@ -1683,13 +1836,33 @@ updateLocalizedText(const UA_LocalizedText *source, UA_LocalizedText *target) {
 }
 
 /* Trigger sampling if a MonitoredItem surveils the attribute with no sampling
- * interval */
+ * interval. This is reached after a successful attribute update from the
+ * network Write service, the UA_Server_write APIs and internal writeAttribute
+ * calls. Async writes enter here when Operation_Write is resumed. */
 #ifdef UA_ENABLE_SUBSCRIPTIONS
 static void
 triggerImmediateDataChange(UA_Server *server, UA_Session *session,
                            UA_Node *node, const UA_WriteValue *wvalue) {
     UA_MonitoredItem *mon = node->head.monitoredItems;
-    for(; mon != NULL; mon = mon->sampling.nodeListNext) {
+    for(; mon != NULL; mon = mon->nodeListNext) {
+        /* Zero-interval items form the list prefix. Only items with a
+         * positive sampling interval follow. */
+        if(mon->parameters.samplingInterval > 0.0)
+            return;
+        switch(mon->samplingType) {
+        case UA_MONITOREDITEMSAMPLINGTYPE_EVENT:
+            /* EVENT also covers OPC UA Event MonitoredItems. Those monitor
+             * EventNotifier and are dispatched by the event subsystem. Here
+             * we only sample zero-interval DataChange MonitoredItems. */
+            if(mon->itemToMonitor.attributeId == UA_ATTRIBUTEID_EVENTNOTIFIER)
+                continue;
+            break;
+        case UA_MONITOREDITEMSAMPLINGTYPE_DELETED:
+        case UA_MONITOREDITEMSAMPLINGTYPE_NONE:
+        case UA_MONITOREDITEMSAMPLINGTYPE_CYCLIC:
+        case UA_MONITOREDITEMSAMPLINGTYPE_PUBLISH:
+            continue;
+        }
         if(mon->itemToMonitor.attributeId != wvalue->attributeId)
             continue;
         /* TODO: Allow async read for datachanges */
@@ -1714,7 +1887,8 @@ triggerImmediateDataChange(UA_Server *server, UA_Session *session,
  * are registered. So that pointer needs to be stable. */
 static UA_StatusCode
 copyAttributeIntoNode(UA_Server *server, UA_Session *session,
-                      UA_Node *node, const UA_WriteValue *wvalue) {
+                      UA_Node *node, void *context /* UA_WriteValue */) {
+    const UA_WriteValue *wvalue = (const UA_WriteValue*)context;
     UA_assert(session != NULL);
     const void *value = wvalue->value.value.data;
     UA_UInt32 userWriteMask = getUserWriteMask(server, session, &node->head);
@@ -1789,6 +1963,7 @@ copyAttributeIntoNode(UA_Server *server, UA_Session *session,
         break;
     case UA_ATTRIBUTEID_VALUE:
         CHECK_NODECLASS_WRITE(UA_NODECLASS_VARIABLE | UA_NODECLASS_VARIABLETYPE);
+        UA_Boolean semanticChange = false;
         if(node->head.nodeClass == UA_NODECLASS_VARIABLE) {
             /* The access to a value variable is granted via the UserAccessLevel
              * attribute (masked with the AccessLevel attribute) */
@@ -1797,11 +1972,70 @@ copyAttributeIntoNode(UA_Server *server, UA_Session *session,
                 retval = UA_STATUSCODE_BADUSERACCESSDENIED;
                 break;
             }
+
+            /* Fast SemanticChange detection. For ordinary Value writes this
+             * adds only an inline AccessLevel bit test. The more expensive
+             * equality and HasProperty-owner checks are reached only for
+             * explicitly marked Properties. */
+            semanticChange =
+                wvalue->value.hasValue &&
+                (node->variableNode.accessLevel &
+                 UA_ACCESSLEVELMASK_SEMANTICCHANGE) != 0;
+            if(semanticChange && wvalue->indexRange.length == 0) {
+                const UA_DataValue *oldValue = NULL;
+                if(node->variableNode.valueSourceType ==
+                   UA_VALUESOURCETYPE_INTERNAL)
+                    oldValue = &node->variableNode.valueSource.internal.value;
+                else if(node->variableNode.valueSourceType ==
+                        UA_VALUESOURCETYPE_EXTERNAL)
+                    oldValue = UA_atomic_load(
+                        node->variableNode.valueSource.external.value);
+                if(oldValue && oldValue->hasValue &&
+                   UA_Variant_equal(&oldValue->value, &wvalue->value.value))
+                    semanticChange = false;
+            }
+            /* Writing a StatusCode different to "Good" requires the
+             * StatusWrite bit (see OPC specification 10000-3: AccessLevelType;
+             * https://reference.opcfoundation.org/specs/OPC-10000-3/v1.05.06/8.57)
+             */
+            if(   (wvalue->value.hasStatus)
+               && (wvalue->value.status != UA_STATUSCODE_GOOD)) {
+                accessLevel = getAccessLevel(server, session, &node->variableNode);
+                if(!(accessLevel & UA_ACCESSLEVELMASK_STATUSWRITE)) {
+                    retval = UA_STATUSCODE_BADWRITENOTSUPPORTED;
+                    break;
+                }
+                accessLevel = getUserAccessLevel(server, session, &node->variableNode);
+                if(!(accessLevel & UA_ACCESSLEVELMASK_STATUSWRITE)) {
+                    retval = UA_STATUSCODE_BADUSERACCESSDENIED;
+                    break;
+                }
+            }
+            /* Writing a SourceTimestamp different to NULL requires the
+             * TimestampWrite bit (see OPC specification 10000-3:
+             * AccessLevelType;
+             * https://reference.opcfoundation.org/specs/OPC-10000-3/v1.05.06/8.57)
+             */
+            if(   (wvalue->value.hasSourceTimestamp)
+               && (wvalue->value.sourceTimestamp != (UA_DateTime)(0))) {
+                accessLevel = getAccessLevel(server, session, &node->variableNode);
+                if(!(accessLevel & UA_ACCESSLEVELMASK_TIMESTAMPWRITE)) {
+                    retval = UA_STATUSCODE_BADWRITENOTSUPPORTED;
+                    break;
+                }
+                accessLevel = getUserAccessLevel(server, session, &node->variableNode);
+                if(!(accessLevel & UA_ACCESSLEVELMASK_TIMESTAMPWRITE)) {
+                    retval = UA_STATUSCODE_BADUSERACCESSDENIED;
+                    break;
+                }
+            }
         } else { /* UA_NODECLASS_VARIABLETYPE */
             CHECK_USERWRITEMASK(UA_WRITEMASK_VALUEFORVARIABLETYPE);
         }
         retval = writeNodeValueAttribute(server, session, &node->variableNode,
                                          &wvalue->value, &wvalue->indexRange);
+        if(retval == UA_STATUSCODE_GOOD && semanticChange)
+            recordSemanticPropertyChange(server, &node->head);
         break;
     case UA_ATTRIBUTEID_DATATYPE:
         CHECK_NODECLASS_WRITE(UA_NODECLASS_VARIABLE | UA_NODECLASS_VARIABLETYPE);
@@ -1891,26 +2125,46 @@ copyAttributeIntoNode(UA_Server *server, UA_Session *session,
     return UA_STATUSCODE_GOOD;
 }
 
-static UA_THREAD_LOCAL UA_Boolean preventAuditEventRecursion = false;
-
 UA_Boolean
 Operation_Write(UA_Server *server, UA_Session *session,
                 const UA_WriteValue *wv, UA_StatusCode *result) {
     UA_assert(session != NULL);
+    beginModelChange(server);
+
+    /* DataType is an inline attribute. Remember its previous value so a
+     * same-value write does not produce a spurious DataTypeChanged event. */
+    UA_Boolean dataTypeChanged = false;
+    if(wv->attributeId == UA_ATTRIBUTEID_DATATYPE) {
+        const UA_Node *oldNode = UA_NODESTORE_GET(server, &wv->nodeId);
+        if(oldNode && (oldNode->head.nodeClass == UA_NODECLASS_VARIABLE ||
+                       oldNode->head.nodeClass == UA_NODECLASS_VARIABLETYPE)) {
+            const UA_NodeId *oldDataType =
+                (oldNode->head.nodeClass == UA_NODECLASS_VARIABLE) ?
+                &oldNode->variableNode.dataType : &oldNode->variableTypeNode.dataType;
+            if(wv->value.value.data &&
+               UA_NodeId_equal(oldDataType,
+                               (const UA_NodeId*)wv->value.value.data))
+                dataTypeChanged = false;
+            else
+                dataTypeChanged = true;
+        }
+        if(oldNode)
+            UA_NODESTORE_RELEASE(server, oldNode);
+    }
 
     /* Get the old value for the audit event */
 #ifdef UA_ENABLE_AUDITING
     UA_DataValue oldValue;
-    if(!preventAuditEventRecursion && server->config.auditingEnabled &&
+    if(!server->preventAuditEventRecursion && server->config.auditingEnabled &&
        server->config.auditWriteUpdateEnabled) {
-        preventAuditEventRecursion = true;
+        server->preventAuditEventRecursion = true;
         UA_ReadValueId rvi;
         UA_ReadValueId_init(&rvi);
         rvi.nodeId = wv->nodeId;
         rvi.attributeId = wv->attributeId;
         rvi.indexRange = wv->indexRange;
         oldValue = readWithSession(server, session, &rvi, UA_TIMESTAMPSTORETURN_NEITHER);
-        preventAuditEventRecursion = false;
+        server->preventAuditEventRecursion = false;
     } else {
         UA_DataValue_init(&oldValue);
     }
@@ -1918,9 +2172,18 @@ Operation_Write(UA_Server *server, UA_Session *session,
 
     *result = editNode(server, session, &wv->nodeId, wv->attributeId,
                        UA_REFERENCETYPESET_NONE, UA_BROWSEDIRECTION_INVALID,
-                       (UA_EditNodeCallback)copyAttributeIntoNode,
+                       copyAttributeIntoNode,
                        (void*)(uintptr_t)wv);
     UA_Boolean done = (*result != UA_STATUSCODE_GOODCOMPLETESASYNCHRONOUSLY);
+
+    /* Only DataType changes are structural model changes. ValueRank and
+     * ArrayDimensions changes do not use a ModelChange verb. SemanticChange
+     * events are triggered separately by Value changes of Properties whose
+     * AccessLevel has the SemanticChange bit set. */
+    if(*result == UA_STATUSCODE_GOOD && dataTypeChanged) {
+        recordModelChangeEvent(server, &wv->nodeId,
+                          UA_MODELCHANGESTRUCTUREVERBMASK_DATATYPECHANGED);
+    }
 
     /* Generate audit event for writing variables.
      * TODO: Audit events for async writes. */
@@ -1934,6 +2197,7 @@ Operation_Write(UA_Server *server, UA_Session *session,
     UA_DataValue_clear(&oldValue);
 #endif
 
+    endModelChange(server);
     return done;
 }
 
@@ -2117,22 +2381,11 @@ UA_Server_writeExecutable(UA_Server *server, const UA_NodeId nodeId,
 }
 
 #ifdef UA_ENABLE_HISTORIZING
-typedef void
- (*UA_HistoryDatabase_readFunc)(UA_Server *server, void *hdbContext,
-                                const UA_NodeId *sessionId, void *sessionContext,
-                                const UA_RequestHeader *requestHeader,
-                                const void *historyReadDetails,
-                                UA_TimestampsToReturn timestampsToReturn,
-                                UA_Boolean releaseContinuationPoints,
-                                size_t nodesToReadSize,
-                                const UA_HistoryReadValueId *nodesToRead,
-                                UA_HistoryReadResponse *response,
-                                void * const * const historyData);
-
 UA_Boolean
 Service_HistoryRead(UA_Server *server, UA_Session *session,
-                    const UA_HistoryReadRequest *request,
-                    UA_HistoryReadResponse *response) {
+                    const void *request_, void *response_) {
+    const UA_HistoryReadRequest *request = (const UA_HistoryReadRequest*)request_;
+    UA_HistoryReadResponse *response = (UA_HistoryReadResponse*)response_;
     UA_assert(session != NULL);
     UA_LOCK_ASSERT(&server->serviceMutex);
     if(server->config.historyDatabase.context == NULL) {
@@ -2145,33 +2398,34 @@ Service_HistoryRead(UA_Server *server, UA_Session *session,
         return true;
     }
 
+    enum HistoryReadKind {
+        HISTORYREAD_RAW,
+        HISTORYREAD_MODIFIED,
+        HISTORYREAD_EVENT,
+        HISTORYREAD_PROCESSED,
+        HISTORYREAD_ATTIME
+    } readKind;
     const UA_DataType *historyDataType = &UA_TYPES[UA_TYPES_HISTORYDATA];
-    UA_HistoryDatabase_readFunc readHistory = NULL;
     if(request->historyReadDetails.content.decoded.type ==
        &UA_TYPES[UA_TYPES_READRAWMODIFIEDDETAILS]) {
         UA_ReadRawModifiedDetails *details = (UA_ReadRawModifiedDetails*)
             request->historyReadDetails.content.decoded.data;
         if(!details->isReadModified) {
-            readHistory = (UA_HistoryDatabase_readFunc)
-                server->config.historyDatabase.readRaw;
+            readKind = HISTORYREAD_RAW;
         } else {
             historyDataType = &UA_TYPES[UA_TYPES_HISTORYMODIFIEDDATA];
-            readHistory = (UA_HistoryDatabase_readFunc)
-                server->config.historyDatabase.readModified;
+            readKind = HISTORYREAD_MODIFIED;
         }
     } else if(request->historyReadDetails.content.decoded.type ==
               &UA_TYPES[UA_TYPES_READEVENTDETAILS]) {
         historyDataType = &UA_TYPES[UA_TYPES_HISTORYEVENT];
-        readHistory = (UA_HistoryDatabase_readFunc)
-            server->config.historyDatabase.readEvent;
+        readKind = HISTORYREAD_EVENT;
     } else if(request->historyReadDetails.content.decoded.type ==
               &UA_TYPES[UA_TYPES_READPROCESSEDDETAILS]) {
-        readHistory = (UA_HistoryDatabase_readFunc)
-            server->config.historyDatabase.readProcessed;
+        readKind = HISTORYREAD_PROCESSED;
     } else if(request->historyReadDetails.content.decoded.type ==
               &UA_TYPES[UA_TYPES_READATTIMEDETAILS]) {
-        readHistory = (UA_HistoryDatabase_readFunc)
-            server->config.historyDatabase.readAtTime;
+        readKind = HISTORYREAD_ATTIME;
     } else {
         /* TODO handle more request->historyReadDetails.content.decoded.type types */
         response->responseHeader.serviceResult = UA_STATUSCODE_BADHISTORYOPERATIONUNSUPPORTED;
@@ -2179,7 +2433,11 @@ Service_HistoryRead(UA_Server *server, UA_Session *session,
     }
 
     /* Check if the configured History-Backend supports the requested history type */
-    if(!readHistory) {
+    if((readKind == HISTORYREAD_RAW && !server->config.historyDatabase.readRaw) ||
+       (readKind == HISTORYREAD_MODIFIED && !server->config.historyDatabase.readModified) ||
+       (readKind == HISTORYREAD_EVENT && !server->config.historyDatabase.readEvent) ||
+       (readKind == HISTORYREAD_PROCESSED && !server->config.historyDatabase.readProcessed) ||
+       (readKind == HISTORYREAD_ATTIME && !server->config.historyDatabase.readAtTime)) {
         UA_LOG_INFO_SESSION(server->config.logging, session,
                             "The configured HistoryBackend does not support the selected history-type");
         response->responseHeader.serviceResult = UA_STATUSCODE_BADNOTSUPPORTED;
@@ -2224,14 +2482,38 @@ Service_HistoryRead(UA_Server *server, UA_Session *session,
                                     data, historyDataType);
         historyData[i] = data;
     }
-    readHistory(server, server->config.historyDatabase.context,
-                &session->sessionId, session->context,
-                &request->requestHeader,
-                request->historyReadDetails.content.decoded.data,
-                request->timestampsToReturn,
-                request->releaseContinuationPoints,
-                request->nodesToReadSize, request->nodesToRead,
-                response, historyData);
+#define CALL_HISTORY_READ(FUNC, DETAILS, DATA)                               \
+    FUNC(server, server->config.historyDatabase.context,                    \
+         &session->sessionId, session->context, &request->requestHeader,    \
+         (const DETAILS*)request->historyReadDetails.content.decoded.data,  \
+         request->timestampsToReturn, request->releaseContinuationPoints,   \
+         request->nodesToReadSize, request->nodesToRead, response,          \
+         (DATA * const * const)historyData)
+
+    switch(readKind) {
+    case HISTORYREAD_RAW:
+        CALL_HISTORY_READ(server->config.historyDatabase.readRaw,
+                          UA_ReadRawModifiedDetails, UA_HistoryData);
+        break;
+    case HISTORYREAD_MODIFIED:
+        CALL_HISTORY_READ(server->config.historyDatabase.readModified,
+                          UA_ReadRawModifiedDetails, UA_HistoryModifiedData);
+        break;
+    case HISTORYREAD_EVENT:
+        CALL_HISTORY_READ(server->config.historyDatabase.readEvent,
+                          UA_ReadEventDetails, UA_HistoryEvent);
+        break;
+    case HISTORYREAD_PROCESSED:
+        CALL_HISTORY_READ(server->config.historyDatabase.readProcessed,
+                          UA_ReadProcessedDetails, UA_HistoryData);
+        break;
+    case HISTORYREAD_ATTIME:
+        CALL_HISTORY_READ(server->config.historyDatabase.readAtTime,
+                          UA_ReadAtTimeDetails, UA_HistoryData);
+        break;
+    }
+
+#undef CALL_HISTORY_READ
     UA_free(historyData);
 
     return true;
@@ -2239,8 +2521,9 @@ Service_HistoryRead(UA_Server *server, UA_Session *session,
 
 UA_Boolean
 Service_HistoryUpdate(UA_Server *server, UA_Session *session,
-                      const UA_HistoryUpdateRequest *request,
-                      UA_HistoryUpdateResponse *response) {
+                      const void *request_, void *response_) {
+    const UA_HistoryUpdateRequest *request = (const UA_HistoryUpdateRequest*)request_;
+    UA_HistoryUpdateResponse *response = (UA_HistoryUpdateResponse*)response_;
     UA_assert(session != NULL);
     UA_LOCK_ASSERT(&server->serviceMutex);
 

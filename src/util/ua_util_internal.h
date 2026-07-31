@@ -134,9 +134,11 @@ UA_StatusCode
 nodeId_printEscape(const UA_NodeId *id, UA_String *output,
                    const UA_NamespaceMapping *nsMapping, UA_Escaping idEsc);
 
+#ifdef UA_TYPES_SIMPLEATTRIBUTEOPERAND
 UA_StatusCode
 sao_parseWithDefaultNsIdx(UA_SimpleAttributeOperand *sao,
                           const UA_String str, UA_UInt16 defaultNsIndex);
+#endif
 
 UA_StatusCode
 encodeDateTime(const UA_DateTime dt, UA_String *output);
@@ -296,9 +298,7 @@ typedef union {
     UA_FindServersRequest findServersRequest;
     UA_GetEndpointsRequest getEndpointsRequest;
 #ifdef UA_ENABLE_DISCOVERY
-# ifdef UA_ENABLE_DISCOVERY_MULTICAST
     UA_FindServersOnNetworkRequest findServersOnNetworkRequest;
-# endif
     UA_RegisterServerRequest registerServerRequest;
     UA_RegisterServer2Request registerServer2Request;
 #endif
@@ -387,8 +387,13 @@ typedef union {
 
 /* Do not expose UA_String_equal_ignorecase to public API as it currently only handles
  * ASCII strings, and not UTF8! */
-UA_Boolean UA_EXPORT
+UA_Boolean
 UA_String_equal_ignorecase(const UA_String *s1, const UA_String *s2);
+
+/* Make a deep copy of val and clear+replace orig.
+ * orig is not touched when the deep copy fails. */
+UA_StatusCode
+UA_replace(void *orig, const void *val, const UA_DataType *type);
 
 /********************/
 /* Encoding Helpers */

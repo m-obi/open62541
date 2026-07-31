@@ -65,7 +65,24 @@ findPubSubComponentFromStatus(UA_Server *server, const UA_NodeId *statusObjectId
                               void **component, UA_Boolean *isPublishSubscribeObject) {
     UA_LOCK_ASSERT(&server->serviceMutex);
 
+    UA_PubSubManager *psm = getPSM(server);
+    if(!psm)
+        return UA_STATUSCODE_BADINTERNALERROR;
+
     *isPublishSubscribeObject = false;
+
+    /* Enable/Disable on the root PubSub Status (PUBLISHSUBSCRIBE_STATUS,
+     * NS0 id 17405) cannot be resolved via the inverse HasComponent browse
+     * below; match the well-known Status ID and route to the PubSubManager. */
+    UA_NodeId statusId = UA_NS0ID(PUBLISHSUBSCRIBE_STATUS);
+    if(UA_NodeId_equal(statusObjectId, &statusId)) {
+        *componentNodeId = UA_NS0ID(PUBLISHSUBSCRIBE);
+        *componentType = UA_PUBSUBCOMPONENT_CONNECTION;
+        *component = psm;
+        *isPublishSubscribeObject = true;
+        return UA_STATUSCODE_GOOD;
+    }
+
     /* Find the parent PubSub component by browsing up from the Status object */
     UA_BrowseDescription bd;
     UA_BrowseDescription_init(&bd);
@@ -86,9 +103,16 @@ findPubSubComponentFromStatus(UA_Server *server, const UA_NodeId *statusObjectId
     UA_NodeId parentTypeId = br.references[0].typeDefinition.nodeId;
     UA_BrowseResult_clear(&br);
 
-    UA_PubSubManager *psm = getPSM(server);
-    if(!psm)
-        return UA_STATUSCODE_BADINTERNALERROR;
+    /* The top-level PublishSubscribe node's Status child resolves directly to
+     * the PubSubManager. Match it explicitly so Enable/Disable route to the
+     * manager instead of relying on the browse fallback below. */
+    UA_NodeId publishSubscribeId = UA_NS0ID(PUBLISHSUBSCRIBE);
+    if(UA_NodeId_equal(componentNodeId, &publishSubscribeId)) {
+        *isPublishSubscribeObject = true;
+        *componentType = UA_PUBSUBCOMPONENT_CONNECTION;
+        *component = psm;
+        return UA_STATUSCODE_GOOD;
+    }
 
     /* Identify component type and find the component */
     UA_NodeId pubsubconnectionTypeId = UA_NS0ID(PUBSUBCONNECTIONTYPE);
@@ -167,7 +191,7 @@ pubSubStateVariableDataSourceRead(UA_Server *server, const UA_NodeId *sessionId,
     
     if(isPublishSubscribeObject) {
         UA_PubSubManager *psm = (UA_PubSubManager*)component;
-        state = (psm->sc.state == UA_LIFECYCLESTATE_STARTED) ? 
+        state = (psm->drv.state == UA_LIFECYCLESTATE_STARTED) ? 
                 UA_PUBSUBSTATE_OPERATIONAL : UA_PUBSUBSTATE_DISABLED;
     } else {
         switch(componentType) {
@@ -225,7 +249,7 @@ enablePubSubObjectAction(UA_Server *server, const UA_NodeId *sessionId, void *se
         return UA_STATUSCODE_BADINTERNALERROR;
 
     if(isPublishSubscribeObject) {
-        if(psm->sc.state != UA_LIFECYCLESTATE_STOPPED)
+        if(psm->drv.state != UA_LIFECYCLESTATE_STOPPED)
             return UA_STATUSCODE_BADINVALIDSTATE;
         UA_PubSubManager_setState(psm, UA_LIFECYCLESTATE_STARTED);
         return UA_STATUSCODE_GOOD;
@@ -307,7 +331,7 @@ disablePubSubObjectAction(UA_Server *server, const UA_NodeId *sessionId, void *s
     /* Handle PublishSubscribe object separately */
     if(isPublishSubscribeObject) {
         /* For PublishSubscribe object, check PubSubManager lifecycle state */
-        if(psm->sc.state == UA_LIFECYCLESTATE_STOPPED)
+        if(psm->drv.state == UA_LIFECYCLESTATE_STOPPED)
             return UA_STATUSCODE_BADINVALIDSTATE;
         /* Disable the PubSubManager by stopping it */
         UA_PubSubManager_setState(psm, UA_LIFECYCLESTATE_STOPPED);
@@ -2188,21 +2212,24 @@ publishedDataItemsTypeDestructor(UA_Server *server,
     void *childContext;
     UA_NodeId node = findSingleChildNode(server, UA_QUALIFIEDNAME(0, "PublishedData"),
                                          UA_NS0ID(HASPROPERTY), *nodeId);
-    getNodeContext(server, node, (void**)&childContext);
-    if(!UA_NodeId_isNull(&node))
+    if(!UA_NodeId_isNull(&node)) {
+        getNodeContext(server, node, (void**)&childContext);
         UA_free(childContext);
+    }
 
     node = findSingleChildNode(server, UA_QUALIFIEDNAME(0, "ConfigurationVersion"),
                                UA_NS0ID(HASPROPERTY), *nodeId);
-    getNodeContext(server, node, (void**)&childContext);
-    if(!UA_NodeId_isNull(&node))
+    if(!UA_NodeId_isNull(&node)) {
+        getNodeContext(server, node, (void**)&childContext);
         UA_free(childContext);
+    }
 
     node = findSingleChildNode(server, UA_QUALIFIEDNAME(0, "DataSetMetaData"),
                                UA_NS0ID(HASPROPERTY), *nodeId);
-    getNodeContext(server, node, (void**)&childContext);
-    if(!UA_NodeId_isNull(&node))
+    if(!UA_NodeId_isNull(&node)) {
+        getNodeContext(server, node, (void**)&childContext);
         UA_free(childContext);
+    }
 }
 
 static void
@@ -2217,14 +2244,16 @@ subscribedDataSetTypeDestructor(UA_Server *server,
     UA_NodeId node =
         findSingleChildNode(server, UA_QUALIFIEDNAME(0, "DataSetMetaData"),
                             UA_NS0ID(HASPROPERTY), *nodeId);
-    getNodeContext(server, node, (void**)&childContext);
-    if(!UA_NodeId_equal(&UA_NODEID_NULL , &node))
+    if(!UA_NodeId_isNull(&node)) {
+        getNodeContext(server, node, (void**)&childContext);
         UA_free(childContext);
+    }
     node = findSingleChildNode(server, UA_QUALIFIEDNAME(0, "IsConnected"),
                                UA_NS0ID(HASPROPERTY), *nodeId);
-    getNodeContext(server, node, (void**)&childContext);
-    if(!UA_NodeId_equal(&UA_NODEID_NULL , &node))
+    if(!UA_NodeId_isNull(&node)) {
+        getNodeContext(server, node, (void**)&childContext);
         UA_free(childContext);
+    }
 }
 
 /*************************************/
@@ -2255,10 +2284,10 @@ UA_loadPubSubConfigMethodCallback(UA_Server *server,
 
 static void
 deletePubSubConfigMethodFinalize(void *application, void *context) {
-    UA_PubSubManager *manager = (UA_PubSubManager *) application;
-    UA_Server *server = manager->sc.server;
-    lockServer(manager->sc.server);
-    UA_PubSubManager_clear(manager);
+    UA_PubSubManager *psm = (UA_PubSubManager *) application;
+    UA_Server *server = psm->drv.server;
+    lockServer(psm->drv.server);
+    UA_PubSubManager_clear(psm);
     unlockServer(server);
     UA_free(context);
 }
@@ -2275,14 +2304,14 @@ UA_deletePubSubConfigMethodCallback(UA_Server *server,
     UA_LOCK_ASSERT(&server->serviceMutex);
     UA_PubSubManager *psm = getPSM(server);
     if(psm) {
-        psm->sc.stop(&psm->sc);
+        psm->drv.stop(&psm->drv);
         UA_DelayedCallback *dc = (UA_DelayedCallback*)UA_calloc(1, sizeof(UA_DelayedCallback));
         if(!dc)
             return UA_STATUSCODE_BADOUTOFMEMORY;
         dc->callback = deletePubSubConfigMethodFinalize;
         dc->application = psm;
         dc->context = dc;
-        server->config.eventLoop->addDelayedCallback(psm->sc.server->config.eventLoop, dc);
+        server->config.eventLoop->addDelayedCallback(psm->drv.server->config.eventLoop, dc);
     }
 
     return UA_STATUSCODE_GOOD;

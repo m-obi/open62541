@@ -11,6 +11,7 @@
  *    Copyright 2017-2018 (c) Mark Giraud, Fraunhofer IOSB
  *    Copyright 2018-2019 (c) HMS Industrial Networks AB (Author: Jonas Green)
  *    Copyright 2025 (c) o6 Automation GmbH (Author: Julius Pfrommer)
+ *    Copyright 2026 (c) o6 Automation GmbH (Author: Andreas Ebner)
  */
 
 #include <open62541/types.h>
@@ -55,8 +56,11 @@ UA_SecureChannel_setSecurityPolicy(UA_SecureChannel *channel, UA_SecurityPolicy 
     UA_CHECK_STATUS_ERROR(res, return res, sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
                           "Could not create the certificate thumbprint");
 
-    /* Set the SecurityPolicy */
+    /* Set the SecurityPolicy and cache the URI-derived properties (the policy
+     * is fixed for the channel's lifetime). */
     channel->securityPolicy = sp;
+    channel->enhancedSecurity = UA_SecurityPolicy_isEnhancedSecurity(sp);
+    channel->legacySequenceNumbers = UA_SecurityPolicy_useLegacySequenceNumbers(sp);
 
     /* Set a temporary SecurityMode. The client sets the final SecurityMode
      * right after. The server only after fully decoding the OPN message in the
@@ -93,10 +97,14 @@ UA_SecureChannel_setSecurityMode(UA_SecureChannel *channel,
 static void
 hideErrors(UA_TcpErrorMessage *const error) {
     switch(error->error) {
+    case UA_STATUSCODE_BADCERTIFICATEINVALID:
+    case UA_STATUSCODE_BADCERTIFICATECHAININCOMPLETE:
+    case UA_STATUSCODE_BADCERTIFICATEPOLICYCHECKFAILED:
     case UA_STATUSCODE_BADCERTIFICATEUNTRUSTED:
+    case UA_STATUSCODE_BADCERTIFICATEREVOCATIONUNKNOWN:
+    case UA_STATUSCODE_BADCERTIFICATEISSUERREVOCATIONUNKNOWN:
     case UA_STATUSCODE_BADCERTIFICATEREVOKED:
     case UA_STATUSCODE_BADCERTIFICATEISSUERREVOKED:
-    case UA_STATUSCODE_BADCERTIFICATECHAININCOMPLETE:
     case UA_STATUSCODE_BADCERTIFICATEISSUERUSENOTALLOWED:
         error->error = UA_STATUSCODE_BADSECURITYCHECKSFAILED;
         error->reason = UA_STRING_NULL;
@@ -199,6 +207,8 @@ UA_SecureChannel_clear(UA_SecureChannel *channel) {
         sp->deleteChannelContext(sp, channel->channelContext);
         channel->securityPolicy = NULL;
         channel->channelContext = NULL;
+        channel->enhancedSecurity = false;     /* No policy => not enhanced */
+        channel->legacySequenceNumbers = true; /* No policy => legacy */
     }
 
     /* Remove remaining delayed callback */
@@ -220,6 +230,11 @@ UA_SecureChannel_clear(UA_SecureChannel *channel) {
     UA_ByteString_clear(&channel->remoteCertificate);
     UA_ByteString_clear(&channel->localNonce);
     UA_ByteString_clear(&channel->remoteNonce);
+
+    /* Clean up the v1.05.07 SecureChannel elements */
+    UA_ByteString_clear(&channel->firstRequestSignature);
+    UA_ByteString_clear(&channel->currentIKM);
+    UA_ByteString_clear(&channel->channelThumbprint);
 
     /* Clean up endpointUrl and remoteAddress */
     UA_String_clear(&channel->endpointUrl);
@@ -392,12 +407,9 @@ encodeHeadersSym(UA_MessageContext *mc, size_t totalLength) {
     else
         header.messageTypeAndChunkType += UA_CHUNKTYPE_INTERMEDIATE;
 
-    /* Increase the sequence number in the channel */
-    channel->sendSequenceNumber++;
-
     UA_SequenceHeader seqHeader;
     seqHeader.requestId = mc->requestId;
-    seqHeader.sequenceNumber = channel->sendSequenceNumber;
+    seqHeader.sequenceNumber = UA_SecureChannel_nextSequenceNumber(channel);
 
     UA_StatusCode res = UA_STATUSCODE_GOOD;
     res |= UA_encodeBinaryInternal(&header, &UA_TRANSPORT[UA_TRANSPORT_TCPMESSAGEHEADER],
@@ -438,8 +450,9 @@ sendSymmetricChunk(UA_MessageContext *mc) {
                          (long unsigned int)
                          ((uintptr_t)mc->buf_pos - (uintptr_t)mc->messageBuffer.data));
 
-    /* Add padding if the message is encrypted */
-    if(channel->securityMode == UA_MESSAGESECURITYMODE_SIGNANDENCRYPT)
+    /* Add padding if the message is encrypted (not for AEAD policies) */
+    if(channel->securityMode == UA_MESSAGESECURITYMODE_SIGNANDENCRYPT &&
+       !UA_SecurityPolicy_isAead(sp))
         padChunk(channel, &sp->symSignatureAlgorithm, &sp->symEncryptionAlgorithm,
                  &mc->messageBuffer.data[UA_SECURECHANNEL_SYMMETRIC_HEADER_UNENCRYPTEDLENGTH],
                  &mc->buf_pos);
@@ -628,11 +641,39 @@ UA_SecureChannel_sendCLO(UA_SecureChannel *channel, UA_UInt32 requestId,
  * Section 6.7.2.4 of the standard. */
 #define UA_SEQUENCENUMBER_ROLLOVER 4294966271
 
+UA_UInt32
+UA_SecureChannel_nextSequenceNumber(UA_SecureChannel *channel) {
+    /* channel->sendSequenceNumber mirrors the reference-stack counter: a
+     * pre-increment value initialized to 0. The legacy scheme emits the
+     * counter (first = 1); the non-legacy scheme emits counter-1 (first = 0). */
+    UA_UInt64 next = (UA_UInt64)channel->sendSequenceNumber + 1;
+    if(channel->legacySequenceNumbers) {
+        /* Legacy rollover: the first number after the max is 1. */
+        if(next > UA_SEQUENCENUMBER_ROLLOVER)
+            next = 1;
+        channel->sendSequenceNumber = (UA_UInt32)next;
+        return channel->sendSequenceNumber;
+    }
+    /* Non-legacy: the counter wraps to 0 after UA_UINT32_MAX so the emitted
+     * value (counter - 1) covers the full UInt32 range and then restarts at 0. */
+    if(next > UA_UINT32_MAX)
+        next = 0;
+    channel->sendSequenceNumber = (UA_UInt32)next;
+    return (channel->sendSequenceNumber == 0) ?
+        UA_UINT32_MAX : (channel->sendSequenceNumber - 1);
+}
+
 #ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
 static UA_StatusCode
 processSequenceNumberSym(UA_SecureChannel *channel, UA_UInt32 sequenceNumber) {
     if(sequenceNumber != channel->receiveSequenceNumber + 1) {
-        if(channel->receiveSequenceNumber + 1 <= UA_SEQUENCENUMBER_ROLLOVER ||
+        /* The non-legacy (ECC) rollover from UA_UINT32_MAX to 0 is already
+         * accepted by the check above (unsigned overflow makes
+         * receiveSequenceNumber + 1 == 0). Only the legacy "< 1024" rollover
+         * needs the special case below; non-legacy policies reject anything
+         * that is not the immediate successor. */
+        if(!channel->legacySequenceNumbers ||
+           channel->receiveSequenceNumber + 1 <= UA_SEQUENCENUMBER_ROLLOVER ||
            sequenceNumber >= 1024)
             return UA_STATUSCODE_BADSECURITYCHECKSFAILED;
         channel->receiveSequenceNumber = sequenceNumber - 1; /* Roll over */
@@ -949,7 +990,7 @@ UA_SecureChannel_getCompleteMessage(UA_SecureChannel *channel,
 
     /* Validate the assembled message size */
     if(channel->config.localMaxMessageSize != 0 &&
-       channel->chunksLength > channel->config.localMaxMessageSize) {
+       messageSize > channel->config.localMaxMessageSize) {
         if(chunk.copied)
             UA_ByteString_clear(&chunk.bytes);
         return UA_STATUSCODE_BADTCPMESSAGETOOLARGE;

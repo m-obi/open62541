@@ -22,7 +22,9 @@
 #include <open62541/common.h>
 #include <open62541/util.h>
 #include <open62541/types.h>
+#ifdef UA_ENABLE_DISCOVERY
 #include <open62541/client.h>
+#endif
 
 #include <open62541/plugin/log.h>
 #include <open62541/plugin/certificategroup.h>
@@ -219,6 +221,19 @@ UA_Server_removeCallback(UA_Server *server, UA_UInt64 callbackId);
 typedef void (*UA_ServerNotificationCallback)(UA_Server *server,
                                               UA_ApplicationNotificationType type,
                                               const UA_KeyValueMap payload);
+
+/**
+ * SecureChannel Handling
+ * ----------------------
+ * The server opens new SecureChannels internally when a server socket is
+ * active. Information about SecureChannels and their state is notified with
+ * UA_APPLICATIONNOTIFICATIONTYPE_SECURECHANNEL. SecureChannels can be manually
+ * closed. This leaves any attached session alive so that it can potentially
+ * reconnect. */
+
+UA_EXPORT UA_StatusCode UA_THREADSAFE
+UA_Server_closeSecureChannel(UA_Server *server, UA_UInt32 channelId,
+                             UA_ShutdownReason reason);
 
 /**
  * .. _server-session-handling:
@@ -623,19 +638,23 @@ UA_Server_browseSimplifiedBrowsePath(UA_Server *server, const UA_NodeId origin,
                                      size_t browsePathSize,
                                      const UA_QualifiedName *browsePath);
 
-#ifndef HAVE_NODEITER_CALLBACK
-#define HAVE_NODEITER_CALLBACK
+/* Returns the target of a "HasTypeDefinition" reference (or inverse
+ * "HasSubtype" reference for type nodes) */
+UA_StatusCode UA_EXPORT UA_THREADSAFE
+UA_Server_getNodeType(UA_Server *server, const UA_NodeId nodeId,
+                      UA_NodeId *outTypeId);
+
 /* Iterate over all nodes referenced by parentNodeId by calling the callback
  * function for each child node (in ifdef because GCC/CLANG handle include order
  * differently) */
 typedef UA_StatusCode
-(*UA_NodeIteratorCallback)(UA_NodeId childId, UA_Boolean isInverse,
+(*UA_ServerNodeIteratorCallback)(UA_NodeId childId, UA_Boolean isInverse,
                            UA_NodeId referenceTypeId, void *handle);
-#endif
 
 UA_StatusCode UA_EXPORT UA_THREADSAFE
 UA_Server_forEachChildNodeCall(UA_Server *server, UA_NodeId parentNodeId,
-                               UA_NodeIteratorCallback callback, void *handle);
+                               UA_ServerNodeIteratorCallback callback,
+                               void *handle);
 
 /**
  * .. _local-monitoreditems:
@@ -965,7 +984,7 @@ UA_Server_setVariableNode_internalValueSource(UA_Server *server,
  * source. */
 UA_StatusCode UA_EXPORT UA_THREADSAFE
 UA_Server_setVariableNode_externalValueSource(UA_Server *server,
-    const UA_NodeId nodeId, UA_DataValue **value,
+    const UA_NodeId nodeId, UA_DataValue** value,
     const UA_ValueSourceNotifications *notifications);
 
 /* It is expected that the read callback is implemented. Whenever the value
@@ -1618,19 +1637,75 @@ UA_Server_createEventEx(UA_Server *server,
 
 #endif /* UA_ENABLE_SUBSCRIPTIONS_EVENTS */
 
+/**
+ * .. _model-semantic-changes:
+ *
+ * Model and Semantic Changes
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * With ``UA_ENABLE_SUBSCRIPTIONS_EVENTS``, the server automatically emits the
+ * standard ``GeneralModelChangeEventType`` and ``SemanticChangeEventType`` for
+ * changes made through OPC UA Services and the corresponding local
+ * ``UA_Server_*`` APIs. Changes made while the server's namespace is initially
+ * populated are suppressed. Both EventTypes are emitted by the Server object.
+ *
+ * A structural change is reported only if the affected Node has a
+ * scalar ``NodeVersion`` Property with the String DataType. The server updates
+ * that Property with the decimal representation of a server-wide, increasing
+ * Int64. Nodes without a suitable ``NodeVersion`` Property are not
+ * included in a ModelChangeEvent. The following successful operations are
+ * reported:
+ *
+ * .. list-table::
+ *    :header-rows: 1
+ *
+ *    * - Operation
+ *      - ModelChange verb
+ *    * - Add a Node
+ *      - ``NodeAdded``
+ *    * - Delete a Node
+ *      - ``NodeDeleted``
+ *    * - Add a Reference
+ *      - ``ReferenceAdded``
+ *    * - Delete a Reference
+ *      - ``ReferenceDeleted``
+ *    * - Change the DataType Attribute
+ *      - ``DataTypeChanged``
+ *
+ * Changes to ValueRank and ArrayDimensions are not structural ModelChanges.
+ *
+ * A SemanticChange is reported when a successful Value write changes a
+ * Variable whose AccessLevel contains ``UA_ACCESSLEVELMASK_SEMANTICCHANGE``.
+ * The Variable must be a Property connected to its owner by ``HasProperty`` or
+ * a subtype. The owner is reported as the affected Node. Same-value writes are
+ * suppressed when the previous value is directly available. For callback-based
+ * value sources the previous value may not be available for comparison, so a
+ * successful write is treated as a SemanticChange.
+ *
+ * A SemanticChange also marks Value MonitoredItems on the affected Variable.
+ * Their next DataChange notification contains the ``SemanticsChanged``
+ * StatusCode bit. MonitoredItems with a zero SamplingInterval are sampled
+ * immediately. For cyclic sampling the bit remains pending until the next
+ * notification.
+ *
+ * Changes are accumulated until the outermost local operation or decoded
+ * Service request completes. Entries for the same affected Node are coalesced
+ * by combining their ModelChange verbs. Model and Semantic changes collected
+ * together are emitted as separate standard Events. Failed operations are not
+ * reported.
+ *
+ * See ``examples/events/server_modelchange.c`` for a complete local example. */
+
 #ifdef UA_ENABLE_DISCOVERY
 
 /**
- * Discovery
- * ---------
- *
- * Registering at a Discovery Server
- * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+ * Remote Discovery Server Registration
+ * ------------------------------------
+ * The current server can register itself at a discovery. For that it requires
+ * to open a client connection. */
 
-/* Register the given server instance at the discovery server. This should be
+/* Register the given server instance at a discovery server. This should be
  * called periodically, for example every 10 minutes, depending on the
- * configuration of the discovery server. You should also call
- * _unregisterDiscovery when the server shuts down.
+ * configuration of the discovery server.
  *
  * The supplied client configuration is used to create a new client to connect
  * to the discovery server. The client configuration is moved over to the server
@@ -1651,264 +1726,175 @@ UA_Server_deregisterDiscovery(UA_Server *server, UA_ClientConfig *cc,
                               const UA_String discoveryServerUrl);
 
 /**
- * Operating a Discovery Server
- * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
-
-/* Callback for RegisterServer. Data is passed from the register call */
-typedef void
-(*UA_Server_registerServerCallback)(const UA_RegisteredServer *registeredServer,
-                                    void* data);
-
-/* Set the callback which is called if another server registeres or unregisters
- * with this instance. This callback is called every time the server gets a
- * register call. This especially means that for every periodic server register
- * the callback will be called.
+ * Local Discovery Server Records
+ * ------------------------------
+ * The Discovery Service-Set allows the registering of local (for FindServers)
+ * and also remote servers (for FindServersOnNetwork).
  *
- * @param server
- * @param cb the callback
- * @param data data passed to the callback
- * @return ``UA_STATUSCODE_SUCCESS`` on success */
-void UA_EXPORT UA_THREADSAFE
-UA_Server_setRegisterServerCallback(UA_Server *server,
-                                    UA_Server_registerServerCallback cb, void* data);
+ * We uniquely identify records by their combination of ServerUri + one matching
+ * DiscoveryUrl. */
 
-#ifdef UA_ENABLE_DISCOVERY_MULTICAST
+UA_StatusCode UA_EXPORT UA_THREADSAFE
+UA_Server_findServers(UA_Server *server, UA_String endpointUrl,
+                      size_t localeIdsSize, UA_LocaleId *localeIds,
+                      size_t serverUrisSize, UA_String *serverUris,
+                      size_t *outServersSize,
+                      UA_ApplicationDescription **outServers);
 
-/* Callback for server detected through mDNS. Data is passed from the register
- * call
+/* Local API for the RegisterServer2 service. If configurationResults is
+ * non-Null, then it must point to an array of discoveryConfigurationSize
+ * length. */
+UA_StatusCode UA_EXPORT UA_THREADSAFE
+UA_Server_registerServer(UA_Server *server,
+                         const UA_RegisteredServer *registeredServer,
+                         const size_t discoveryConfigurationSize,
+                         const UA_ExtensionObject *discoveryConfiguration,
+                         UA_StatusCode *configurationResults);
+
+/* Remove the servers matching the ServerUri and at least one of the
+ * provided DiscoveryUrls */
+UA_StatusCode UA_EXPORT UA_THREADSAFE
+UA_Server_deregisterServer(UA_Server *server, const UA_String serverUri,
+                           size_t discoveryUrlsSize,
+                           const UA_String *discoveryUrls);
+
+/**
+ * The server internally manages the ServersOnNetwork list. Multicast discovery
+ * is implemented on top in a driver outside of the core library. */
+
+UA_StatusCode UA_EXPORT UA_THREADSAFE
+UA_Server_findServersOnNetwork(UA_Server *server, UA_String endpointUrl,
+                               UA_UInt32 startingRecordId,
+                               UA_UInt32 maxRecordsToReturn,
+                               size_t serverCapabilityFilterSize,
+                               const UA_String *serverCapabilityFilter,
+                               UA_DateTime *outLastCounterResetTime,
+                               size_t *outServersSize,
+                               UA_ServerOnNetwork **outServers);
+
+/* Register a remote server. If the server name was previously known, the
+ * existing entry gets updated. The parameter kv-map can be extended with
+ * additional parameters in the future. Currently supported are:
  *
- * @param isServerAnnounce indicates if the server has just been detected. If
- *        set to false, this means the server is shutting down.
- * @param isTxtReceived indicates if we already received the corresponding TXT
- *        record with the path and caps data */
-typedef void
-(*UA_Server_serverOnNetworkCallback)(const UA_ServerOnNetwork *serverOnNetwork,
-                                     UA_Boolean isServerAnnounce,
-                                     UA_Boolean isTxtReceived, void* data);
+ * 0:remote-address [String]
+ *    IP-address or other host identifier from which the information
+ *    was received.
+ * 0:ttl [UInt32]
+ *    Time-to-live of DNS information. Zero means infinite. */
+UA_StatusCode UA_EXPORT UA_THREADSAFE
+UA_Server_registerServerOnNetwork(UA_Server *server,
+                                  const UA_ServerOnNetwork *son,
+                                  const UA_KeyValueMap params);
 
-/* Set the callback which is called if another server is found through mDNS or
- * deleted. It will be called for any mDNS message from the remote server, thus
- * it may be called multiple times for the same instance. Also the SRV and TXT
- * records may arrive later, therefore for the first call the server
- * capabilities may not be set yet. If called multiple times, previous data will
- * be overwritten.
- *
- * @param server
- * @param cb the callback
- * @param data data passed to the callback
- * @return ``UA_STATUSCODE_SUCCESS`` on success */
-void UA_EXPORT UA_THREADSAFE
-UA_Server_setServerOnNetworkCallback(UA_Server *server,
-                                     UA_Server_serverOnNetworkCallback cb,
-                                     void* data);
-
-#endif /* UA_ENABLE_DISCOVERY_MULTICAST */
+/* Remove the entry of the remote server with the matching ServerName */
+UA_StatusCode UA_EXPORT UA_THREADSAFE
+UA_Server_deregisterServerOnNetwork(UA_Server *server,
+                                    UA_String serverName);
 
 #endif /* UA_ENABLE_DISCOVERY */
 
 /**
- * Alarms & Conditions (Experimental)
- * ---------------------------------- */
-
-#ifdef UA_ENABLE_SUBSCRIPTIONS_ALARMS_CONDITIONS
-typedef enum UA_TwoStateVariableCallbackType {
-  UA_ENTERING_ENABLEDSTATE,
-  UA_ENTERING_ACKEDSTATE,
-  UA_ENTERING_CONFIRMEDSTATE,
-  UA_ENTERING_ACTIVESTATE
-} UA_TwoStateVariableCallbackType;
-
-/* Callback prototype to set user specific callbacks */
-typedef UA_StatusCode
-(*UA_TwoStateVariableChangeCallback)(UA_Server *server, const UA_NodeId *condition);
-
-/* Create condition instance. The function checks first whether the passed
- * conditionType is a subType of ConditionType. Then checks whether the
- * condition source has HasEventSource reference to its parent. If not, a
- * HasEventSource reference will be created between condition source and server
- * object. To expose the condition in address space, a hierarchical
- * ReferenceType should be passed to create the reference to condition source.
- * Otherwise, UA_NODEID_NULL should be passed to make the condition not exposed.
+ * .. _drivers:
  *
- * @param server The server object
- * @param conditionId The NodeId of the requested Condition Object. When passing
- *        UA_NODEID_NUMERIC(X,0) an unused nodeid in namespace X will be used.
- *        E.g. passing UA_NODEID_NULL will result in a NodeId in namespace 0.
- * @param conditionType The NodeId of the node representation of the ConditionType
- * @param conditionName The name of the condition to be created
- * @param conditionSource The NodeId of the Condition Source (Parent of the Condition)
- * @param hierarchialReferenceType The NodeId of Hierarchical ReferenceType
- *                                 between Condition and its source
- * @param outConditionId The NodeId of the created Condition
- * @return The StatusCode of the UA_Server_createCondition method */
-UA_StatusCode UA_EXPORT
-UA_Server_createCondition(UA_Server *server,
-                          const UA_NodeId conditionId,
-                          const UA_NodeId conditionType,
-                          const UA_QualifiedName conditionName,
-                          const UA_NodeId conditionSource,
-                          const UA_NodeId hierarchialReferenceType,
-                          UA_NodeId *outConditionId);
-
-/* The method pair UA_Server_addCondition_begin and _finish splits the
- * UA_Server_createCondtion in two parts similiar to the
- * UA_Server_addNode_begin / _finish pair. This is useful if the node shall be
- * modified before finish the instantiation. For example to add children with
- * specific NodeIds.
- * For details refer to the UA_Server_addNode_begin / _finish methods.
+ * Drivers
+ * -------
+ * Drivers are different from other "plugins" in that they have an explicit
+ * stateful lifecycle and can be started/stopped at runtime. Their lifecycle is
+ * however dependent on the server into which the drivers are embedded. When the
+ * server shuts down, the drivers are also stopped.
  *
- * Additionally to UA_Server_addNode_begin UA_Server_addCondition_begin checks
- * if the passed condition type is a subtype of the OPC UA ConditionType.
+ * Drivers can use the server's public API to the full extent. For example
+ * add/remove nodes, or register connections and timers in the server's
+ * EventLoop.
  *
- * @param server The server object
- * @param conditionId The NodeId of the requested Condition Object. When passing
- *        UA_NODEID_NUMERIC(X,0) an unused nodeid in namespace X will be used.
- *        E.g. passing UA_NODEID_NULL will result in a NodeId in namespace 0.
- * @param conditionType The NodeId of the node representation of the ConditionType
- * @param conditionName The name of the condition to be added
- * @param outConditionId The NodeId of the added Condition
- * @return The StatusCode of the UA_Server_addCondition_begin method */
-UA_StatusCode UA_EXPORT
-UA_Server_addCondition_begin(UA_Server *server,
-                             const UA_NodeId conditionId,
-                             const UA_NodeId conditionType,
-                             const UA_QualifiedName conditionName,
-                             UA_NodeId *outConditionId);
+ * Some drivers define core functionality and are added internally in the server
+ * implementation. */
 
-/* Second call of the UA_Server_addCondition_begin and _finish pair.
- * Additionally to UA_Server_addNode_finish UA_Server_addCondition_finish:
- *  - checks whether the condition source has HasEventSource reference to its
- *    parent. If not, a HasEventSource reference will be created between
- *    condition source and server object
- *  - exposes the condition in the address space if hierarchialReferenceType is
- *    not UA_NODEID_NULL by adding a reference of this type from the condition
- *    source to the condition instance
- *  - initializes the standard condition fields and callbacks
- *
- * @param server The server object
- * @param conditionId The NodeId of the unfinished Condition Object
- * @param conditionSource The NodeId of the Condition Source (Parent of the Condition)
- * @param hierarchialReferenceType The NodeId of Hierarchical ReferenceType
- *                                 between Condition and its source
- * @return The StatusCode of the UA_Server_addCondition_finish method */
+typedef enum {
+    UA_DRIVERTYPE_GENERIC = 0,
+    UA_DRIVERTYPE_GDS_RECEIVER
+} UA_DriverType;
 
-UA_StatusCode UA_EXPORT
-UA_Server_addCondition_finish(UA_Server *server,
-                              const UA_NodeId conditionId,
-                              const UA_NodeId conditionSource,
-                              const UA_NodeId hierarchialReferenceType);
+struct UA_Driver;
+typedef struct UA_Driver UA_Driver;
 
-/* Set the value of condition field.
- *
- * @param server The server object
- * @param condition The NodeId of the node representation of the Condition Instance
- * @param value Variant Value to be written to the Field
- * @param fieldName Name of the Field in which the value should be written
- * @return The StatusCode of the UA_Server_setConditionField method*/
-UA_StatusCode UA_EXPORT UA_THREADSAFE
-UA_Server_setConditionField(UA_Server *server,
-                            const UA_NodeId condition,
-                            const UA_Variant *value,
-                            const UA_QualifiedName fieldName);
+/* Callback through which the server notifies the driver
+ * about runtime changes and internal events. */
+typedef void
+(*UA_DriverNotificationCallback)(UA_Driver *drv,
+                                 UA_ApplicationNotificationType type,
+                                 const UA_KeyValueMap payload);
 
-/* Set the value of property of condition field.
- *
- * @param server The server object
- * @param condition The NodeId of the node representation of the Condition
- *        Instance
- * @param value Variant Value to be written to the Field
- * @param variableFieldName Name of the Field which has a property
- * @param variablePropertyName Name of the Field Property in which the value
- *        should be written
- * @return The StatusCode of the UA_Server_setConditionVariableFieldProperty*/
-UA_StatusCode UA_EXPORT
-UA_Server_setConditionVariableFieldProperty(UA_Server *server,
-                                            const UA_NodeId condition,
-                                            const UA_Variant *value,
-                                            const UA_QualifiedName variableFieldName,
-                                            const UA_QualifiedName variablePropertyName);
+struct UA_Driver {
+    UA_Driver *next; /* linked-list */
 
-/* Triggers an event only for an enabled condition. The condition list is
- * updated then with the last generated EventId.
- *
- * @param server The server object
- * @param condition The NodeId of the node representation of the Condition Instance
- * @param conditionSource The NodeId of the node representation of the Condition Source
- * @param outEventId last generated EventId
- * @return The StatusCode of the UA_Server_triggerConditionEvent method */
-UA_StatusCode UA_EXPORT
-UA_Server_triggerConditionEvent(UA_Server *server,
-                                const UA_NodeId condition,
-                                const UA_NodeId conditionSource,
-                                UA_ByteString *outEventId);
+    /*
+     * Configuration
+     */
 
-/* Add an optional condition field using its name. (TODO Adding optional methods
- * is not implemented yet)
- *
- * @param server The server object
- * @param condition The NodeId of the node representation of the Condition Instance
- * @param conditionType The NodeId of the node representation of the Condition Type
- * from which the optional field comes
- * @param fieldName Name of the optional field
- * @param outOptionalVariable The NodeId of the created field (Variable Node)
- * @return The StatusCode of the UA_Server_addConditionOptionalField method */
-UA_StatusCode UA_EXPORT
-UA_Server_addConditionOptionalField(UA_Server *server,
-                                    const UA_NodeId condition,
-                                    const UA_NodeId conditionType,
-                                    const UA_QualifiedName fieldName,
-                                    UA_NodeId *outOptionalVariable);
+    UA_DriverType driverType;
+    UA_String name;
 
-/* Function used to set a user specific callback to TwoStateVariable Fields of a
- * condition. The callbacks will be called before triggering the events when
- * transition to true State of EnabledState/Id, AckedState/Id, ConfirmedState/Id
- * and ActiveState/Id occurs.
- *
- * @param server The server object
- * @param condition The NodeId of the node representation of the Condition Instance
- * @param conditionSource The NodeId of the node representation of the Condition Source
- * @param removeBranch (Not Implemented yet)
- * @param callback User specific callback function
- * @param callbackType Callback function type, indicates where it should be called
- * @return The StatusCode of the UA_Server_setConditionTwoStateVariableCallback method */
-UA_StatusCode UA_EXPORT
-UA_Server_setConditionTwoStateVariableCallback(UA_Server *server,
-                                               const UA_NodeId condition,
-                                               const UA_NodeId conditionSource,
-                                               UA_Boolean removeBranch,
-                                               UA_TwoStateVariableChangeCallback callback,
-                                               UA_TwoStateVariableCallbackType callbackType);
+    /* See the driver-specific documentation for possible parameters.
+     * The params need to be cleaned up within the _free method. */
+    UA_KeyValueMap params;
 
-/* Delete a condition from the address space and the internal lists.
- *
- * @param server The server object
- * @param condition The NodeId of the node representation of the Condition Instance
- * @param conditionSource The NodeId of the node representation of the Condition Source
- * @return ``UA_STATUSCODE_GOOD`` on success */
-UA_StatusCode UA_EXPORT
-UA_Server_deleteCondition(UA_Server *server,
-                          const UA_NodeId condition,
-                          const UA_NodeId conditionSource);
+    /* Backpointer to the server. Must be set before _start is called. If NULL
+     * this is set by the server during registering. Generally the server must
+     * not be switched out once the driver has been started. */
+    UA_Server *server;
 
-/* Set the LimitState of the LimitAlarmType
- *
- * @param server The server object
- * @param conditionId NodeId of the node representation of the Condition Instance
- * @param limitValue The value from the trigger node */
-UA_StatusCode UA_EXPORT
-UA_Server_setLimitState(UA_Server *server, const UA_NodeId conditionId,
-                        UA_Double limitValue);
+    /* The server forwards its internal notifications to all drivers. In order
+     * to avoid overload, the filter must be set. The top 32bit are ANDed with
+     * the notification type to see if the driver is interested in the
+     * notification. See the common.h for details on the notification types and
+     * their payload. */
+    UA_DriverNotificationCallback notificationCallback;
+    UA_ApplicationNotificationType notificationFilter;
 
-/* Parse the certifcate and set Expiration date
- *
- * @param server The server object
- * @param conditionId NodeId of the node representation of the Condition Instance
- * @param cert The certificate for parsing */
-UA_StatusCode UA_EXPORT
-UA_Server_setExpirationDate(UA_Server *server, const UA_NodeId conditionId,
-                            UA_ByteString  cert);
+    /*
+     * Lifecycle management
+     */
 
-#endif /* UA_ENABLE_SUBSCRIPTIONS_ALARMS_CONDITIONS */
+    UA_LifecycleState state;
+
+    /* Start the Driver. It will typically register timers/connections in the
+     * EventLoop and may add nodes in the server's information model. Starting
+     * can fail if the server is not already started also.
+     *
+     * During startup, the server calls start on all registered drivers. */
+    UA_StatusCode (*start)(UA_Driver *sc);
+
+    /* Stopping is asynchronous and might need a few iterations of the eventloop
+     * to succeed. All Drivers are stopped during the shutdown of the server.
+     * Once fully stopped, the Driver must no longer rely on the server
+     * backpointer. So it can be detached and _free'd at runtime of the
+     * server. */
+    void (*stop)(UA_Driver *sc);
+
+    /* Clean up and delete the Driver. Can fail if it is not fully stopped. When
+     * successfully removed, the Driver must no longer be accessed from the
+     * server.
+     *
+     * Drivers are all free'd when the server is deleted. If a Driver is
+     * manually removed before, then it needs to be unlinked from the server's
+     * internal linked-list before. */
+    UA_StatusCode (*free)(UA_Driver *sc);
+};
+
+/* Adds the Driver to the server. Starts the driver if the server is already
+ * started. */
+UA_StatusCode
+UA_Server_addDriver(UA_Server *server, UA_Driver *drv);
+
+/* Remove the Driver from the server. This will fail if the driver is not fully
+ * stopped. */
+UA_StatusCode
+UA_Server_removeDriver(UA_Server *server, UA_Driver *drv);
+
+/* Get the first entry of the server's driver linked list. */
+UA_Driver *
+UA_Server_getDrivers(UA_Server *server);
 
 /**
  * Statistics
@@ -2033,7 +2019,7 @@ UA_Server_readObjectProperty(UA_Server *server, const UA_NodeId objectId,
  * Role-Based Access Control (RBAC)
  * --------------------------------
  *
- * Role-Based Access Control implementation per OPC UA Part 18.
+ * Role-Based Access Control implementation per OPC UA Part 18 v1.05.
  *
  * **WARNING**: This feature is EXPERIMENTAL and NOT FOR PRODUCTION USE.
  * The RBAC implementation is under active development and the API may change.
@@ -2078,7 +2064,7 @@ UA_RolePermissionSet_copy(const UA_RolePermissionSet *src,
 
 /* UA_Role
  * Represents an OPC UA role with identity mapping rules and optional
- * application/endpoint restrictions per OPC UA Part 18. */
+ * application/endpoint restrictions per OPC UA Part 18 v1.05 §4.4. */
 typedef struct {
     UA_NodeId roleId;
     UA_QualifiedName roleName;              /* BrowseName of the role */
@@ -2219,6 +2205,7 @@ struct UA_ServerConfig {
     UA_ServerNotificationCallback sessionNotificationCallback;
     UA_ServerNotificationCallback serviceNotificationCallback;
     UA_ServerNotificationCallback subscriptionNotificationCallback;
+    UA_ServerNotificationCallback discoveryNotificationCallback;
 #ifdef UA_ENABLE_AUDITING
     UA_ServerNotificationCallback auditNotificationCallback;
 #endif
@@ -2348,25 +2335,29 @@ struct UA_ServerConfig {
     /* Discovery
      * ~~~~~~~~~ */
 #ifdef UA_ENABLE_DISCOVERY
+    /* Enable the internal management of RegisteredServers (besides the local
+     * server itself) via the RegisterServer and FindServer services. */
+    UA_Boolean registeredServersEnabled;
+
     /* Timeout in seconds when to automatically remove a registered server from
      * the list, if it doesn't re-register within the given time frame. A value
      * of 0 disables automatic removal. Default is 60 Minutes (60*60). Must be
      * bigger than 10 seconds, because cleanup is only triggered approximately
      * every 10 seconds. The server will still be removed depending on the
      * state of the semaphore file. */
-    UA_UInt32 discoveryCleanupTimeout;
+    UA_UInt32 registeredServerCleanupTimeout;
 
-# ifdef UA_ENABLE_DISCOVERY_MULTICAST
-    UA_Boolean mdnsEnabled;
-    UA_MdnsDiscoveryConfiguration mdnsConfig;
-#  ifdef UA_ENABLE_DISCOVERY_MULTICAST_MDNSD
-    UA_String mdnsInterfaceIP;
-#   if !defined(UA_HAS_GETIFADDR)
-    size_t mdnsIpAddressListSize;
-    UA_UInt32 *mdnsIpAddressList;
-#   endif
-#  endif
-# endif
+    /* mDNS based Announcement and Discovery is implemented in a driver that
+     * attach to a server outside the main configuration. The
+     * FindServersOnNetwork Server is however implemented by the server itself.
+     * The drivers interact with the server via the Discovery API. For example
+     * to add/update/remove a ServerOnNetwork structure. */
+
+    /* Enable the internal management of ServerOnNetwork entries and the
+     * FindServersOnNetwork Service. This is used in conjunction with mDNS to
+     * implement a Discovery Server that detects other servers on the
+     * network. */
+    UA_Boolean serversOnNetworkEnabled;
 #endif
 
     /* Subscriptions
@@ -2395,19 +2386,9 @@ struct UA_ServerConfig {
     /* Limits for PublishRequests */
     UA_UInt32 maxPublishReqPerSession;
 
-    /* Register MonitoredItem in Userland
-     *
-     * @param server Allows the access to the server object
-     * @param sessionId The session id, represented as an node id
-     * @param sessionContext An optional pointer to user-defined data for the
-     *        specific data source
-     * @param nodeid Id of the node in question
-     * @param nodeidContext An optional pointer to user-defined data, associated
-     *        with the node in the nodestore. Note that, if the node has already
-     *        been removed, this value contains a NULL pointer.
-     * @param attributeId Identifies which attribute (value, data type etc.) is
-     *        monitored
-     * @param removed Determines if the MonitoredItem was removed or created. */
+    /* Register MonitoredItem in Userland.
+     * Deprecated now. Use the ServerNotificationCallback mechanism with
+     * UA_APPLICATIONNOTIFICATIONTYPE_MONITOREDITEM for the same feature.
     void (*monitoredItemRegisterCallback)(UA_Server *server,
                                           const UA_NodeId *sessionId,
                                           void *sessionContext,
@@ -2415,6 +2396,7 @@ struct UA_ServerConfig {
                                           void *nodeContext,
                                           UA_UInt32 attibuteId,
                                           UA_Boolean removed);
+    */
 #endif
 
     /* PubSub
@@ -2511,7 +2493,7 @@ struct UA_ServerConfig {
 
     /* If true, all permissions are granted regardless of roles.
      * WARNING: Effectively disables authorization. Use for testing only. */
-    UA_Boolean allPermissionsForAnonymousRole;
+    UA_Boolean allPermissionsForAnonymous;
 #endif
 };
 
@@ -2522,32 +2504,6 @@ UA_DEPRECATED static UA_INLINE void
 UA_ServerConfig_clean(UA_ServerConfig *config) {
     UA_ServerConfig_clear(config);
 }
-
-/**
- * Update the Server Certificate at Runtime
- * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
- * If certificateGroupId is null the DefaultApplicationGroup is used.
- */
-
-UA_StatusCode UA_EXPORT
-UA_Server_updateCertificate(UA_Server *server,
-                            const UA_NodeId certificateGroupId,
-                            const UA_NodeId certificateTypeId,
-                            const UA_ByteString certificate,
-                            const UA_ByteString *privateKey);
-
-/* Creates a PKCS #10 DER encoded certificate request signed with the server's
- * private key.
- * If certificateGroupId is null the DefaultApplicationGroup is used.
- */
-UA_StatusCode UA_EXPORT
-UA_Server_createSigningRequest(UA_Server *server,
-                               const UA_NodeId certificateGroupId,
-                               const UA_NodeId certificateTypeId,
-                               const UA_String *subjectName,
-                               const UA_Boolean *regenerateKey,
-                               const UA_ByteString *nonce,
-                               UA_ByteString *csr);
 
 /* Adds certificates and Certificate Revocation Lists (CRLs) to a specific
  * certificate group on the server.
@@ -2618,13 +2574,16 @@ UA_Server_removeCertificates(UA_Server *server,
  * @param rolePermissions Array of role-permission mappings
  * @param recursive If true, also set for all hierarchically referenced
  *        child nodes
+ * @param options Reserved for future use (e.g. to restrict the reference
+ *        type for recursive traversal). Pass NULL for now.
  * @return UA_STATUSCODE_GOOD on success */
 UA_StatusCode UA_EXPORT UA_THREADSAFE
 UA_Server_setNodeRolePermissions(UA_Server *server,
                                  const UA_NodeId nodeId,
                                  size_t rolePermissionsSize,
                                  const UA_RolePermission *rolePermissions,
-                                 UA_Boolean recursive);
+                                 UA_Boolean recursive,
+                                 const UA_KeyValueMap *options);
 
 /* Get the role permissions of a node.
  *
@@ -2672,7 +2631,8 @@ UA_Server_removeNodeRolePermissions(UA_Server *server,
 /* Add a role to the server's role registry.
  *
  * The role's BrowseName (roleName) is the primary unique identifier,
- * per OPC UA Part 18 Section 4.2. A role with the same roleName or
+ * per OPC UA Part 18 v1.05 §4.2.2 (AddRole: "The BrowseName shall be
+ * unique within the RoleSet Object"). A role with the same roleName or
  * roleId must not already exist.
  *
  * If role->roleId is null, the server auto-assigns a random numeric
@@ -2807,8 +2767,11 @@ UA_Server_updateRole(UA_Server *server, const UA_Role *role);
  * @param outRoleNames Output: deep-copy array of QualifiedNames
  * @return UA_STATUSCODE_GOOD on success */
 UA_StatusCode UA_EXPORT UA_THREADSAFE
-UA_Server_getSessionRoleNames(UA_Server *server, const UA_NodeId *sessionId,
+UA_Server_getSessionRoleNames(UA_Server *server, const UA_NodeId sessionId,
                               size_t *outSize, UA_QualifiedName **outRoleNames);
+
+/* Convenience bitmask: all permission bits set */
+#define UA_PERMISSIONTYPE_ALL ((UA_PermissionType)0xFFFFFFFF)
 
 /**
  * Per-Role Node Permission Management
@@ -2823,14 +2786,16 @@ UA_Server_getSessionRoleNames(UA_Server *server, const UA_NodeId *sessionId,
  * @param server The server instance
  * @param nodeId The node to modify
  * @param roleId The role to add permissions for
- * @param permissionType Permission bitmask to set
- * @param overwriteExisting If true, replace; if false, OR with existing
+ * @param permissions Permission bitmask to set
+ * @param overwriteExisting If true, replace the role's existing permission
+ *        bitmask entirely; if false, OR (merge) the new bits into the
+ *        existing bitmask
  * @param recursive If true, apply recursively to child nodes
  * @return UA_STATUSCODE_GOOD on success */
 UA_StatusCode UA_EXPORT UA_THREADSAFE
 UA_Server_addRolePermissions(UA_Server *server, const UA_NodeId nodeId,
                              const UA_NodeId roleId,
-                             UA_PermissionType permissionType,
+                             UA_PermissionType permissions,
                              UA_Boolean overwriteExisting,
                              UA_Boolean recursive);
 
@@ -2839,16 +2804,93 @@ UA_Server_addRolePermissions(UA_Server *server, const UA_NodeId nodeId,
  * @param server The server instance
  * @param nodeId The node to modify
  * @param roleId The role to remove permissions for
- * @param permissionType Permission bitmask to clear
+ * @param permissions Permission bitmask to clear
  * @param recursive If true, apply recursively to child nodes
  * @return UA_STATUSCODE_GOOD on success */
 UA_StatusCode UA_EXPORT UA_THREADSAFE
 UA_Server_removeRolePermissions(UA_Server *server, const UA_NodeId nodeId,
                                 const UA_NodeId roleId,
-                                UA_PermissionType permissionType,
+                                UA_PermissionType permissions,
                                 UA_Boolean recursive);
 
+/**
+ * Namespace Default Role Permissions
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * Per OPC UA Part 5: if a node has no explicit RolePermissions,
+ * the DefaultRolePermissions from the NamespaceMetadata apply.
+ *
+ * Permission resolution order:
+ *  1. Explicit node RolePermissions (set via addRolePermissions)
+ *  2. Namespace default RolePermissions (set via this API) */
+
+/* Set default role permissions for a namespace.
+ * Overwrites any previously set defaults for the given namespace.
+ *
+ * @param server The server instance
+ * @param namespaceIndex The namespace index
+ * @param entriesSize Number of role-permission entries
+ * @param entries Array of role-permission entries (deep-copied)
+ * @return UA_STATUSCODE_GOOD on success */
+UA_StatusCode UA_EXPORT UA_THREADSAFE
+UA_Server_setNamespaceDefaultRolePermissions(UA_Server *server,
+                                             UA_UInt16 namespaceIndex,
+                                             size_t entriesSize,
+                                             const UA_RolePermission *entries);
+
+/* Get default role permissions for a namespace.
+ * Returns a deep copy. The caller must free each entry's roleId
+ * with UA_NodeId_clear and the array with UA_free.
+ *
+ * @param server The server instance
+ * @param namespaceIndex The namespace index
+ * @param entriesSize Output: number of entries
+ * @param entries Output: deep-copied array (caller must free)
+ * @return UA_STATUSCODE_GOOD on success */
+UA_StatusCode UA_EXPORT UA_THREADSAFE
+UA_Server_getNamespaceDefaultRolePermissions(UA_Server *server,
+                                             UA_UInt16 namespaceIndex,
+                                             size_t *entriesSize,
+                                             UA_RolePermission **entries);
+
 #endif /* UA_ENABLE_RBAC */
+
+/**
+ * .. _server-json-config:
+ *
+ * Configuration from File
+ * -----------------------
+ *
+ * The server can be configured from JSON5-formatted content stored in a
+ * ``UA_ByteString``.
+ *
+ * The example files ``examples/json_config/server_json_config.json5`` and
+ * ``examples/server_json_config.c`` document the intended workflow and the
+ * currently supported keys. They cover the common runtime limits as well as
+ * optional blocks for discovery, subscriptions, historizing, PubSub and
+ * security policy configuration.
+ *
+ * The following functions require JSON encoding support
+ * (``UA_ENABLE_JSON_ENCODING``). */
+
+#ifdef UA_ENABLE_JSON_ENCODING
+
+/* Loads the server configuration from a Json5 file into the server.
+ *
+ * @param jsonConfig The configuration in json5 format.
+ */
+UA_EXPORT UA_Server *
+UA_Server_newFromFile(const UA_ByteString jsonConfig);
+
+/* Loads a server configuration from a file.  The passed server configuration
+ * is cleared.  Memory will be allocated for fields in config.
+ *
+ * @param config The server configuration.
+ * @param jsonConfig The configuration in json5 format.
+ */
+UA_EXPORT UA_StatusCode
+UA_ServerConfig_loadFromFile(UA_ServerConfig *config, const UA_ByteString jsonConfig);
+
+#endif /* UA_ENABLE_JSON_ENCODING */
 
 _UA_END_DECLS
 

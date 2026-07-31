@@ -88,44 +88,43 @@ UA_EventLoopLWIP_addDelayedCallback(UA_EventLoop *public_el,
     UA_EventLoopLWIP *el = (UA_EventLoopLWIP*)public_el;
     dc->next = NULL;
 
-    /* el->delayedTail points either to prev->next or to the head.
-     * We need to update two locations:
-     * 1: el->delayedTail = &dc->next;
-     * 2: *oldtail = dc; (equal to &dc->next)
+    /* el->delayedTail points either to prev->next or to the head. In an atomic
+     * xchg-operation we make the tail point to dc. This also gives us
+     * prev->next. Then we make prev->next point to dc.
      *
-     * Once we have (1), we "own" the previous-to-last entry. No need to worry
-     * about (2), we can adjust it with a delay. This makes the queue
-     * "eventually consistent". */
-    UA_DelayedCallback **oldtail = (UA_DelayedCallback**)
-        UA_atomic_xchg((void**)&el->delayedTail, &dc->next);
-    UA_atomic_xchg((void**)oldtail, &dc->next);
+     * This is thread-safe. Another thread might retrieve dc from the tail.
+     * Then he can set dc->next while we are still updating prev->next.
+     * It is ensured that only on thread can updated dc->next. */
+    UA_atomic(UA_atomic(UA_DelayedCallback*)*) prev_next;
+    UA_atomic_xchg(&el->delayedTail, &dc->next, &prev_next);
+    UA_atomic_store(prev_next, dc);
 }
 
 /* Resets the delayed queue and returns the previous head and tail */
 static void
-resetDelayedQueue(UA_EventLoopLWIP *el, UA_DelayedCallback **oldHead,
-                  UA_DelayedCallback **oldTail) {
+resetDelayedQueue(UA_EventLoopLWIP *el,
+                  UA_atomic(UA_DelayedCallback*)* oldHead,
+                  UA_atomic(UA_atomic(UA_DelayedCallback*)*)* oldTail) {
     if(el->delayedHead1 <= (UA_DelayedCallback *)0x01 &&
        el->delayedHead2 <= (UA_DelayedCallback *)0x01)
         return; /* The queue is empty */
 
     UA_Boolean active1 = (el->delayedHead1 != (UA_DelayedCallback*)0x01);
-    UA_DelayedCallback **activeHead = (active1) ? &el->delayedHead1 : &el->delayedHead2;
-    UA_DelayedCallback **inactiveHead = (active1) ? &el->delayedHead2 : &el->delayedHead1;
+    UA_atomic(UA_DelayedCallback*)* activeHead = (active1) ? &el->delayedHead1 : &el->delayedHead2;
+    UA_atomic(UA_DelayedCallback*)* inactiveHead = (active1) ? &el->delayedHead2 : &el->delayedHead1;
 
-    /* Switch active/inactive by resetting the sentinel values. The (old) active
-     * head points to an element which we return. Parallel threads continue to
-     * add elements to the queue "below" the first element. */
-    UA_atomic_xchg((void**)inactiveHead, NULL);
-    *oldHead = (UA_DelayedCallback *)
-        UA_atomic_xchg((void**)activeHead, (void*)0x01);
+    /* Set NULL to the inactive head. This indicates it is now active. */
+    UA_atomic_store(inactiveHead, NULL);
 
-    /* Make the tail point to the (new) active head. Return the value of last
-     * tail. When iterating over the queue elements, we need to find this tail
-     * as the last element. If we find a NULL next-pointer before hitting the
-     * tail spinlock until the pointer updates (eventually consistent). */
-    *oldTail = (UA_DelayedCallback*)
-        UA_atomic_xchg((void**)&el->delayedTail, inactiveHead);
+    /* Set a sentinel value to "inactivate" the active head. Return the old
+     * active head. Parallel threads may continue to add elements below the old
+     * "activeHead" if they already have a pointer. */
+    UA_atomic_xchg(activeHead, (UA_DelayedCallback*)0x01, oldHead);
+
+    /* Make the inactiveHead the new "active" by pointing to it from the tail.
+     * Also return the old tail. From the consumer-thread we can then iterate
+     * the linked-list until we find the old tail as the last element. */
+    UA_atomic_xchg(&el->delayedTail, inactiveHead, oldTail);
 }
 
 static void
@@ -135,8 +134,14 @@ UA_EventLoopLWIP_removeDelayedCallback(UA_EventLoop *public_el,
     UA_LOCK(&el->elMutex);
 
     /* Reset and get the old head and tail */
-    UA_DelayedCallback *cur = NULL, *tail = NULL;
+    UA_atomic(UA_DelayedCallback *) cur = NULL;
+    UA_atomic(UA_atomic(UA_DelayedCallback*)*) tail = NULL;
     resetDelayedQueue(el, &cur, &tail);
+
+    /* tail points to the location where the next element shall be inserted: The
+     * next-pointer of the last element. Since the next-pointer is the first
+     * struct member, we can directly cast to the last element. */
+    UA_DelayedCallback *last = (UA_DelayedCallback*)(uintptr_t)tail;
 
     /* Loop until we reach the tail (or head and tail are both NULL) */
     UA_DelayedCallback *next;
@@ -144,8 +149,8 @@ UA_EventLoopLWIP_removeDelayedCallback(UA_EventLoop *public_el,
         /* Spin-loop until the next-pointer of cur is updated.
          * The element pointed to by tail must appear eventually. */
         next = cur->next;
-        while(!next && cur != tail)
-            next = (UA_DelayedCallback *)UA_atomic_load((void**)&cur->next);
+        while(!next && cur != last)
+            next = UA_atomic_load(&cur->next);
         if(cur == dc)
             continue;
         UA_EventLoopLWIP_addDelayedCallback(public_el, cur);
@@ -162,20 +167,24 @@ processDelayed(UA_EventLoopLWIP *el) {
     UA_LOCK_ASSERT(&el->elMutex);
 
     /* Reset and get the old head and tail */
-    UA_DelayedCallback *dc = NULL, *tail = NULL;
+    UA_atomic(UA_DelayedCallback *) dc = NULL;
+    UA_atomic(UA_atomic(UA_DelayedCallback*)*) tail = NULL;
     resetDelayedQueue(el, &dc, &tail);
+
+    /* tail points to the location where the next element shall be inserted: The
+     * next-pointer of the last element. Since the next-pointer is the first
+     * struct member, we can directly cast to the last element. */
+    UA_DelayedCallback *last = (UA_DelayedCallback*)(uintptr_t)tail;
 
     /* Loop until we reach the tail (or head and tail are both NULL) */
     UA_DelayedCallback *next;
     for(; dc; dc = next) {
         next = dc->next;
-        while(!next && dc != tail)
-            next = (UA_DelayedCallback *)UA_atomic_load((void**)&dc->next);
+        while(!next && dc != last)
+            next = UA_atomic_load(&dc->next);
         if(!dc->callback)
             continue;
-        UA_UNLOCK(&el->elMutex);
         dc->callback(dc->application, dc->context);
-        UA_LOCK(&el->elMutex);
     }
 }
 
@@ -262,9 +271,7 @@ UA_EventLoopLWIP_start(UA_EventLoopLWIP *el) {
     /* Start the EventSources */
     UA_EventSource *es = el->eventLoop.eventSources;
     while(es) {
-        UA_UNLOCK(&el->elMutex);
         res |= es->start(es);
-        UA_LOCK(&el->elMutex);
         es = es->next;
     }
 
@@ -326,9 +333,7 @@ UA_EventLoopLWIP_stop(UA_EventLoopLWIP *el) {
     for(; es; es = es->next) {
         if(es->state == UA_EVENTSOURCESTATE_STARTING ||
            es->state == UA_EVENTSOURCESTATE_STARTED) {
-            UA_UNLOCK(&el->elMutex);
             es->stop(es);
-            UA_LOCK(&el->elMutex);
         }
     }
 
@@ -368,9 +373,7 @@ UA_EventLoopLWIP_run(UA_EventLoopLWIP *el, UA_UInt32 timeout) {
     UA_DateTime dateBefore =
         el->eventLoop.dateTime_nowMonotonic(&el->eventLoop);
 
-    UA_UNLOCK(&el->elMutex);
     UA_DateTime dateNext = UA_Timer_process(&el->timer, dateBefore);
-    UA_LOCK(&el->elMutex);
 
     /* Process delayed callbacks here:
      * - Removes closed sockets already here instead of polling them again.
@@ -540,9 +543,7 @@ UA_EventLoopLWIP_free(UA_EventLoopLWIP *el) {
     /* Deregister and delete all the EventSources */
     while(el->eventLoop.eventSources) {
         UA_EventSource *es = el->eventLoop.eventSources;
-        UA_UNLOCK(&el->elMutex);
         UA_EventLoopLWIP_deregisterEventSource(el, es);
-        UA_LOCK(&el->elMutex);
         es->free(es);
     }
 
@@ -613,6 +614,16 @@ static void defaultNetifShutdown(UA_EventLoopLWIP *el) {
 
 #endif
 
+static void
+UA_EventLoopLWIP_lock(UA_EventLoop *public_el) {
+    UA_LOCK(&((UA_EventLoopLWIP*)public_el)->elMutex);
+}
+
+static void
+UA_EventLoopLWIP_unlock(UA_EventLoop *public_el) {
+    UA_UNLOCK(&((UA_EventLoopLWIP*)public_el)->elMutex);
+}
+
 UA_EventLoop *
 UA_EventLoop_new_LWIP(const UA_Logger *logger, UA_EventLoopConfiguration *config) {
     UA_EventLoopLWIP *el = (UA_EventLoopLWIP*)
@@ -674,6 +685,9 @@ UA_EventLoop_new_LWIP(const UA_Logger *logger, UA_EventLoopConfiguration *config
         (UA_StatusCode (*)(UA_EventLoop*, UA_EventSource*))
         UA_EventLoopLWIP_deregisterEventSource;
 
+    el->eventLoop.lock = UA_EventLoopLWIP_lock;
+    el->eventLoop.unlock = UA_EventLoopLWIP_unlock;
+
     return &el->eventLoop;
 }
 
@@ -687,10 +701,9 @@ UA_EventLoopLWIP_allocNetworkBuffer(UA_ConnectionManager *cm,
                                      UA_ByteString *buf,
                                      size_t bufSize) {
     UA_LWIPConnectionManager *pcm = (UA_LWIPConnectionManager*)cm;
-    if(pcm->txBuffer.length == 0)
-        return UA_ByteString_allocBuffer(buf, bufSize);
+    /* Reuse the static tx buffer; fall back to allocation for larger messages. */
     if(pcm->txBuffer.length < bufSize)
-        return UA_STATUSCODE_BADOUTOFMEMORY;
+        return UA_ByteString_allocBuffer(buf, bufSize);
     *buf = pcm->txBuffer;
     buf->length = bufSize;
     return UA_STATUSCODE_GOOD;
@@ -709,27 +722,19 @@ UA_EventLoopLWIP_freeNetworkBuffer(UA_ConnectionManager *cm,
 
 UA_StatusCode
 UA_EventLoopLWIP_allocateStaticBuffers(UA_LWIPConnectionManager *pcm) {
-    UA_StatusCode res = UA_STATUSCODE_GOOD;
-    UA_UInt32 rxBufSize = 1u << 10; /* The default is 64kb */
-    const UA_UInt32 *configRxBufSize = (const UA_UInt32 *)
-        UA_KeyValueMap_getScalar(&pcm->cm.eventSource.params,
-                                 UA_QUALIFIEDNAME(0, "recv-bufsize"),
-                                 &UA_TYPES[UA_TYPES_UINT32]);
-    if(configRxBufSize)
-        rxBufSize = *configRxBufSize;
-    if(pcm->rxBuffer.length != rxBufSize) {
-        UA_ByteString_clear(&pcm->rxBuffer);
-        res = UA_ByteString_allocBuffer(&pcm->rxBuffer, rxBufSize);
-    }
+    UA_StatusCode res =
+        UA_EventLoopCommon_allocStaticBuffer(&pcm->cm.eventSource.params,
+                                             UA_QUALIFIEDNAME(0, "recv-bufsize"),
+                                             1u << 13, /* The default is 8 kb */
+                                             &pcm->rxBuffer);
 
-    const UA_UInt32 *txBufSize = (const UA_UInt32 *)
-        UA_KeyValueMap_getScalar(&pcm->cm.eventSource.params,
-                                 UA_QUALIFIEDNAME(0, "send-bufsize"),
-                                 &UA_TYPES[UA_TYPES_UINT32]);
-    if(txBufSize && pcm->txBuffer.length != *txBufSize) {
-        UA_ByteString_clear(&pcm->txBuffer);
-        res |= UA_ByteString_allocBuffer(&pcm->txBuffer, *txBufSize);
-    }
+    /* Default the tx buffer to the rx size so a dedicated static send buffer
+     * always exists. This avoids a malloc/free on every send without reusing
+     * the rx buffer (which may still hold unprocessed received data). */
+    res |= UA_EventLoopCommon_allocStaticBuffer(&pcm->cm.eventSource.params,
+                                                UA_QUALIFIEDNAME(0, "send-bufsize"),
+                                                (UA_UInt32)pcm->rxBuffer.length,
+                                                &pcm->txBuffer);
     return res;
 }
 

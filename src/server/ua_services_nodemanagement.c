@@ -16,10 +16,15 @@
  *    Copyright 2021 (c) Christian von Arnim, ISW University of Stuttgart  (for VDW and umati)
  *    Copyright 2017 (c) Henrik Norrman
  *    Copyright 2021 (c) Fraunhofer IOSB (Author: Andreas Ebner)
+ *    Copyright 2026 (c) o6 Automation GmbH (Author: Andreas Ebner)
  */
 
 #include "ua_server_internal.h"
 #include "ua_services.h"
+
+#ifdef UA_ENABLE_RBAC
+#include "ua_server_rbac.h"
+#endif
 
 /*********************/
 /* Edit Node Context */
@@ -47,16 +52,16 @@ getNodeContext(UA_Server *server, UA_NodeId nodeId,
 
 static UA_StatusCode
 setDeconstructedNode(UA_Server *server, UA_Session *session,
-                     UA_NodeHead *head, void *context) {
-    head->constructed = false;
+                     UA_Node *node, void *context /* unused */) {
+    node->head.constructed = false;
     return UA_STATUSCODE_GOOD;
 }
 
 static UA_StatusCode
 setConstructedNodeContext(UA_Server *server, UA_Session *session,
-                          UA_NodeHead *head, void *context) {
-    head->context = context;
-    head->constructed = true;
+                          UA_Node *node, void *context /* nodeContext */) {
+    node->head.context = context;
+    node->head.constructed = true;
     return UA_STATUSCODE_GOOD;
 }
 
@@ -410,15 +415,17 @@ useVariableTypeAttributes(UA_Server *server, UA_Session *session,
     /* If no value is set, see if the vt provides one and copy it. This needs to
      * be done before copying the datatype from the vt, as setting the datatype
      * triggers a typecheck. */
-    UA_ReadValueId item;
-    UA_ReadValueId_init(&item);
-    item.nodeId = node->head.nodeId;
-    item.attributeId = UA_ATTRIBUTEID_VALUE;
-    UA_DataValue dv = readWithSession(server, session, &item,
-                                      UA_TIMESTAMPSTORETURN_NEITHER);
+    UA_DataValue origDv;
+    UA_DataValue_init(&origDv);
+    UA_StatusCode retval = readValueAttribute(server, session, node, &origDv);
+    if(retval != UA_STATUSCODE_GOOD)
+        return retval;
 
-    UA_StatusCode retval = UA_STATUSCODE_GOOD;
-    if(dv.hasValue && !dv.value.type) {
+    if(origDv.hasValue && origDv.value.type) {
+        /* A value is present */
+        UA_DataValue_clear(&origDv);
+    } else {
+        UA_DataValue_clear(&origDv);
         UA_DataValue v;
         UA_DataValue_init(&v);
         retval = readValueAttribute(server, session, (const UA_VariableNode*)vt, &v);
@@ -437,7 +444,6 @@ useVariableTypeAttributes(UA_Server *server, UA_Session *session,
             retval = UA_STATUSCODE_GOOD;
         }
     }
-    UA_DataValue_clear(&dv);
 
     /* If no datatype is given, use the datatype of the vt */
     if(UA_NodeId_isNull(&node->dataType)) {
@@ -600,13 +606,40 @@ isMandatoryChild(UA_Server *server, UA_Session *session,
     return found;
 }
 
+#define UA_MAX_NODE_INSTANTIATION_DEPTH 64
+
+static UA_StatusCode
+beginChildInstantiation(UA_Server *server, UA_Session *session,
+                        const UA_NodeId *destinationNodeId,
+                        const UA_NodeId *sourceNodeId) {
+    if(server->nodeInstantiationDepth >= UA_MAX_NODE_INSTANTIATION_DEPTH) {
+        UA_LOG_WARNING_SESSION(server->config.logging, session,
+                               "AddNode (%N): Recursive child instantiation "
+                               "exceeded the maximum depth %u while copying %N",
+                               *destinationNodeId,
+                               UA_MAX_NODE_INSTANTIATION_DEPTH, *sourceNodeId);
+        return UA_STATUSCODE_BADTYPEDEFINITIONINVALID;
+    }
+
+    server->nodeInstantiationDepth++;
+    return UA_STATUSCODE_GOOD;
+}
+
+static void
+endChildInstantiation(UA_Server *server) {
+    UA_assert(server->nodeInstantiationDepth > 0);
+    server->nodeInstantiationDepth--;
+}
+
 static UA_StatusCode
 copyAllChildren(UA_Server *server, UA_Session *session,
                 const UA_NodeId *source, const UA_NodeId *destination);
 
 static void
-Operation_addReference(UA_Server *server, UA_Session *session, void *context,
-                       const UA_AddReferencesItem *item, UA_StatusCode *retval);
+Operation_addReference(UA_Server *server, UA_Session *session,
+                       const void *context /* unused */,
+                       const void *request /* UA_AddReferencesItem */,
+                       void *response /* UA_StatusCode */);
 
 UA_StatusCode
 addRefWithSession(UA_Server *server, UA_Session *session, const UA_NodeId *sourceId,
@@ -682,6 +715,12 @@ copyObjectVariableChild(UA_Server *server, UA_Session *session,
     node->head.constructed = false;
 #ifdef UA_ENABLE_SUBSCRIPTIONS
     node->head.monitoredItems = NULL;
+#endif
+#ifdef UA_ENABLE_RBAC
+    /* The new instance child starts without explicit RolePermissions (falls
+     * back to the namespace defaults). Keeping the copied permissionIndex
+     * would reference the shared entry without adjusting its refCount. */
+    node->head.permissionIndex = UA_PERMISSION_INDEX_INVALID;
 #endif
 
     /* The value source callbacks are copied by default. But we don't want
@@ -798,8 +837,15 @@ copyChild(UA_Server *server, UA_Session *session,
     /* Existing child with that browseName. Deep-copy missing members. */
     if(retval == UA_STATUSCODE_GOOD) {
         if(rd->nodeClass == UA_NODECLASS_VARIABLE ||
-           rd->nodeClass == UA_NODECLASS_OBJECT)
-            retval = copyAllChildren(server, session, &rd->nodeId.nodeId, &existingChild);
+           rd->nodeClass == UA_NODECLASS_OBJECT) {
+            retval = beginChildInstantiation(server, session, destinationNodeId,
+                                             &rd->nodeId.nodeId);
+            if(retval == UA_STATUSCODE_GOOD) {
+                retval = copyAllChildren(server, session, &rd->nodeId.nodeId,
+                                         &existingChild);
+                endChildInstantiation(server);
+            }
+        }
         UA_NodeId_clear(&existingChild);
         return retval;
     }
@@ -837,7 +883,12 @@ copyChild(UA_Server *server, UA_Session *session,
     /* Child is a variable or object */
     if(rd->nodeClass == UA_NODECLASS_VARIABLE ||
        rd->nodeClass == UA_NODECLASS_OBJECT) {
+        retval = beginChildInstantiation(server, session, destinationNodeId,
+                                         &rd->nodeId.nodeId);
+        if(retval != UA_STATUSCODE_GOOD)
+            return retval;
         retval = copyObjectVariableChild(server, session, destinationNodeId, rd);
+        endChildInstantiation(server);
     }
 
     return retval;
@@ -1402,7 +1453,7 @@ recursiveCallConstructors(UA_Server *server, UA_Session *session,
     /* Set the context *and* mark the node as constructed */
     retval = editNode(server, &server->adminSession, nodeId,
                       0, UA_REFERENCETYPESET_NONE, UA_BROWSEDIRECTION_INVALID,
-                      (UA_EditNodeCallback)setConstructedNodeContext, context);
+                      setConstructedNodeContext, context);
     if(retval != UA_STATUSCODE_GOOD)
         goto local_destructor;
 
@@ -1674,8 +1725,8 @@ addNode_finish(UA_Server *server, UA_Session *session, const UA_NodeId *nodeId) 
 }
 
 static void
-Operation_addNode(UA_Server *server, UA_Session *session, void *nodeContext,
-                  const UA_AddNodesItem *item, UA_AddNodesResult *result) {
+Operation_addNode_inner(UA_Server *server, UA_Session *session, void *nodeContext,
+                        const UA_AddNodesItem *item, UA_AddNodesResult *result) {
     result->statusCode =
         Operation_addNode_begin(server, session, nodeContext,
                                 item, &item->parentNodeId.nodeId,
@@ -1687,14 +1738,32 @@ Operation_addNode(UA_Server *server, UA_Session *session, void *nodeContext,
     result->statusCode = addNode_finish(server, session, &result->addedNodeId);
 
     /* If finishing failed, the node was deleted */
-    if(result->statusCode != UA_STATUSCODE_GOOD)
+    if(result->statusCode != UA_STATUSCODE_GOOD) {
         UA_NodeId_clear(&result->addedNodeId);
+    } else {
+        recordModelChangeEvent(server, &result->addedNodeId,
+                          UA_MODELCHANGESTRUCTUREVERBMASK_NODEADDED);
+    }
+}
+
+static void
+Operation_addNode(UA_Server *server, UA_Session *session,
+                  const void *context /* void *nodeContext */,
+                  const void *request /* UA_AddNodesItem */,
+                  void *response /* UA_AddNodesResult */) {
+    void *nodeContext = (void*)(uintptr_t)context;
+    const UA_AddNodesItem *item = (const UA_AddNodesItem*)request;
+    UA_AddNodesResult *result = (UA_AddNodesResult*)response;
+    beginModelChange(server);
+    Operation_addNode_inner(server, session, nodeContext, item, result);
+    endModelChange(server);
 }
 
 UA_Boolean
 Service_AddNodes(UA_Server *server, UA_Session *session,
-                 const UA_AddNodesRequest *request,
-                 UA_AddNodesResponse *response) {
+                 const void *request_, void *response_) {
+    const UA_AddNodesRequest *request = (const UA_AddNodesRequest*)request_;
+    UA_AddNodesResponse *response = (UA_AddNodesResponse*)response_;
     UA_LOG_DEBUG_SESSION(server->config.logging, session, "Processing AddNodesRequest");
     UA_LOCK_ASSERT(&server->serviceMutex);
 
@@ -1706,7 +1775,7 @@ Service_AddNodes(UA_Server *server, UA_Session *session,
 
     response->responseHeader.serviceResult =
         allocProcessServiceOperations(server, session,
-                                      (UA_ServiceOperation)Operation_addNode, NULL,
+                                      Operation_addNode, NULL,
                                       &request->nodesToAddSize,
                                       &UA_TYPES[UA_TYPES_ADDNODESITEM],
                                       &response->resultsSize,
@@ -1897,7 +1966,12 @@ UA_Server_addNode_begin(UA_Server *server, const UA_NodeClass nodeClass,
 UA_StatusCode
 UA_Server_addNode_finish(UA_Server *server, const UA_NodeId nodeId) {
     lockServer(server);
+    beginModelChange(server);
     UA_StatusCode retval = addNode_finish(server, &server->adminSession, &nodeId);
+    if(retval == UA_STATUSCODE_GOOD)
+        recordModelChangeEvent(server, &nodeId,
+                          UA_MODELCHANGESTRUCTUREVERBMASK_NODEADDED);
+    endModelChange(server);
     unlockServer(server);
     return retval;
 }
@@ -1907,8 +1981,10 @@ UA_Server_addNode_finish(UA_Server *server, const UA_NodeId nodeId) {
 /****************/
 
 static void
-Operation_deleteReference(UA_Server *server, UA_Session *session, void *context,
-                          const UA_DeleteReferencesItem *item, UA_StatusCode *retval);
+Operation_deleteReference(UA_Server *server, UA_Session *session,
+                          const void *context /* unused */,
+                          const void *request /* UA_DeleteReferencesItem */,
+                          void *response /* UA_StatusCode */);
 
 struct RemoveIncomingContext {
     UA_Server *server;
@@ -2031,7 +2107,7 @@ deconstructNodeSet(UA_Server *server, UA_Session *session,
         /* Set the constructed flag to false */
         editNode(server, &server->adminSession, &refTree->targets[i].nodeId,
                  0, UA_REFERENCETYPESET_NONE, UA_BROWSEDIRECTION_INVALID,
-                 (UA_EditNodeCallback)setDeconstructedNode, NULL);
+                 setDeconstructedNode, NULL);
     }
 }
 
@@ -2125,16 +2201,23 @@ deleteNodeSet(UA_Server *server, UA_Session *session,
         const UA_Node *member = UA_NODESTORE_GET(server, &refTree->targets[i-1].nodeId);
         if(!member)
             continue;
-        UA_NODESTORE_RELEASE(server, member);
+#ifdef UA_ENABLE_RBAC
+        /* Release the reference of the deleted node on its shared
+         * role-permission entry */
+        UA_Server_decrementRolePermissionsRefCount(server, member->head.permissionIndex);
+#endif
+        /* Everything that dereferences member must happen before the node is
+         * released; remove by the RefTree's own NodeId copy afterwards. */
         if(removeTargetRefs)
             removeIncomingReferences(server, session, &member->head);
-        UA_NODESTORE_REMOVE(server, &member->head.nodeId);
+        UA_NODESTORE_RELEASE(server, member);
+        UA_NODESTORE_REMOVE(server, &refTree->targets[i-1].nodeId);
     }
 }
 
 static void
-deleteNodeOperation(UA_Server *server, UA_Session *session, void *context,
-                    const UA_DeleteNodesItem *item, UA_StatusCode *result) {
+deleteNodeOperation_inner(UA_Server *server, UA_Session *session,
+                          const UA_DeleteNodesItem *item, UA_StatusCode *result) {
     UA_LOCK_ASSERT(&server->serviceMutex);
 
     /* Do not check access for server */
@@ -2197,16 +2280,33 @@ deleteNodeOperation(UA_Server *server, UA_Session *session, void *context,
     }
 
     /* Deconstruct, then delete, then clean up the set */
+    for(size_t i = 0; i < refTree.size; i++)
+        recordModelChangeEvent(server, &refTree.targets[i].nodeId,
+                               UA_MODELCHANGESTRUCTUREVERBMASK_NODEDELETED);
     deconstructNodeSet(server, session, &hierarchRefsSet, &refTree);
     deleteNodeSet(server, session, &hierarchRefsSet,
                   item->deleteTargetReferences, &refTree);
     RefTree_clear(&refTree);
 }
 
+static void
+deleteNodeOperation(UA_Server *server, UA_Session *session,
+                    const void *context /* unused */,
+                    const void *request /* UA_DeleteNodesItem */,
+                    void *response /* UA_StatusCode */) {
+    const UA_DeleteNodesItem *item = (const UA_DeleteNodesItem*)request;
+    UA_StatusCode *result = (UA_StatusCode*)response;
+    (void)context;
+    beginModelChange(server);
+    deleteNodeOperation_inner(server, session, item, result);
+    endModelChange(server);
+}
+
 UA_Boolean
 Service_DeleteNodes(UA_Server *server, UA_Session *session,
-                    const UA_DeleteNodesRequest *request,
-                    UA_DeleteNodesResponse *response) {
+                    const void *request_, void *response_) {
+    const UA_DeleteNodesRequest *request = (const UA_DeleteNodesRequest*)request_;
+    UA_DeleteNodesResponse *response = (UA_DeleteNodesResponse*)response_;
     UA_LOG_DEBUG_SESSION(server->config.logging, session,
                          "Processing DeleteNodesRequest");
     UA_LOCK_ASSERT(&server->serviceMutex);
@@ -2219,8 +2319,9 @@ Service_DeleteNodes(UA_Server *server, UA_Session *session,
 
     response->responseHeader.serviceResult =
         allocProcessServiceOperations(server, session,
-                                      (UA_ServiceOperation)deleteNodeOperation,
-                                      NULL, &request->nodesToDeleteSize,
+                                      deleteNodeOperation,
+                                      NULL,
+                                      &request->nodesToDeleteSize,
                                       &UA_TYPES[UA_TYPES_DELETENODESITEM],
                                       &response->resultsSize,
                                       &UA_TYPES[UA_TYPES_STATUSCODE]);
@@ -2237,7 +2338,11 @@ UA_StatusCode
 UA_Server_deleteNode(UA_Server *server, const UA_NodeId nodeId,
                      UA_Boolean deleteReferences) {
     lockServer(server);
-    UA_StatusCode retval = deleteNode(server, nodeId, deleteReferences);
+    UA_DeleteNodesItem item;
+    item.deleteTargetReferences = deleteReferences;
+    item.nodeId = nodeId;
+    UA_StatusCode retval = UA_STATUSCODE_GOOD;
+    deleteNodeOperation(server, &server->adminSession, NULL, &item, &retval);
     unlockServer(server);
     return retval;
 }
@@ -2250,7 +2355,14 @@ deleteNode(UA_Server *server, const UA_NodeId nodeId,
     item.deleteTargetReferences = deleteReferences;
     item.nodeId = nodeId;
     UA_StatusCode retval = UA_STATUSCODE_GOOD;
-    deleteNodeOperation(server, &server->adminSession, NULL, &item, &retval);
+#ifdef UA_ENABLE_SUBSCRIPTIONS_EVENTS
+    server->modelChangeSuppressionDepth++;
+#endif
+    deleteNodeOperation_inner(server, &server->adminSession, &item, &retval);
+#ifdef UA_ENABLE_SUBSCRIPTIONS_EVENTS
+    UA_assert(server->modelChangeSuppressionDepth > 0);
+    server->modelChangeSuppressionDepth--;
+#endif
     return retval;
 }
 
@@ -2259,11 +2371,13 @@ deleteNode(UA_Server *server, const UA_NodeId nodeId,
 /******************/
 
 static void
-Operation_addReference(UA_Server *server, UA_Session *session, void *context,
-                       const UA_AddReferencesItem *item, UA_StatusCode *retval) {
+Operation_addReference_inner(UA_Server *server, UA_Session *session, void *context,
+                             const UA_AddReferencesItem *item, UA_StatusCode *retval) {
     (void)context;
     UA_assert(session);
     UA_LOCK_ASSERT(&server->serviceMutex);
+    UA_Boolean firstChanged = false;
+    UA_Boolean secondChanged = false;
 
     /* Check access rights */
     if(session != &server->adminSession && server->config.accessControl.allowAddReference) {
@@ -2326,6 +2440,17 @@ Operation_addReference(UA_Server *server, UA_Session *session, void *context,
             *retval = UA_STATUSCODE_BADTARGETNODEIDINVALID;
             return;
         }
+        if(item->targetNodeClass != UA_NODECLASS_UNSPECIFIED &&
+           item->targetNodeClass != targetNode->head.nodeClass) {
+            UA_LOG_DEBUG_SESSION(server->config.logging, session,
+                                 "Cannot add reference - target %N has NodeClass %u "
+                                 "but request expects %u",
+                                 item->targetNodeId.nodeId, (unsigned)targetNode->head.nodeClass,
+                                 (unsigned)item->targetNodeClass);
+            UA_NODESTORE_RELEASE(server, targetNode);
+            *retval = UA_STATUSCODE_BADNODECLASSINVALID;
+            return;
+        }
     }
 
     UA_Node *sourceNode =
@@ -2342,7 +2467,8 @@ Operation_addReference(UA_Server *server, UA_Session *session, void *context,
     }
 
     /* Add the first direction */
-    UA_UInt32 targetNameHash = UA_QualifiedName_hash(&targetNode->head.browseName);
+    UA_UInt32 targetNameHash = targetNode ?
+        UA_QualifiedName_hash(&targetNode->head.browseName) : 0;
     *retval = UA_Node_addReference(sourceNode, refTypeIndex, item->isForward,
                                    &item->targetNodeId, targetNameHash);
     UA_Boolean firstExisted = false;
@@ -2352,6 +2478,7 @@ Operation_addReference(UA_Server *server, UA_Session *session, void *context,
     }
     if(*retval != UA_STATUSCODE_GOOD)
         goto cleanup;
+    firstChanged = !firstExisted;
 
     /* Add the second direction */
     if(targetNode) {
@@ -2361,6 +2488,8 @@ Operation_addReference(UA_Server *server, UA_Session *session, void *context,
         UA_UInt32 sourceNameHash = UA_QualifiedName_hash(&sourceNode->head.browseName);
         *retval = UA_Node_addReference(targetNode, refTypeIndex, !item->isForward,
                                        &expSourceId, sourceNameHash);
+        if(*retval == UA_STATUSCODE_GOOD)
+            secondChanged = true;
 
         /* Second direction existed already */
         if(*retval == UA_STATUSCODE_BADDUPLICATEREFERENCENOTALLOWED) {
@@ -2372,20 +2501,44 @@ Operation_addReference(UA_Server *server, UA_Session *session, void *context,
         }
 
         /* Remove first direction if the second direction failed */
-        if(*retval != UA_STATUSCODE_GOOD)
+        if(*retval != UA_STATUSCODE_GOOD) {
             UA_Node_deleteReference(sourceNode, refTypeIndex, item->isForward, &item->targetNodeId);
+            firstChanged = false;
+        }
     }
 
  cleanup:
+    if(*retval == UA_STATUSCODE_GOOD) {
+        if(firstChanged)
+            recordModelChangeEvent(server, &item->sourceNodeId,
+                              UA_MODELCHANGESTRUCTUREVERBMASK_REFERENCEADDED);
+        if(secondChanged)
+            recordModelChangeEvent(server, &item->targetNodeId.nodeId,
+                              UA_MODELCHANGESTRUCTUREVERBMASK_REFERENCEADDED);
+    }
     if(targetNode)
         UA_NODESTORE_RELEASE(server, targetNode);
     UA_NODESTORE_RELEASE(server, sourceNode);
 }
 
+static void
+Operation_addReference(UA_Server *server, UA_Session *session,
+                       const void *context /* unused */,
+                       const void *request /* UA_AddReferencesItem */,
+                       void *response /* UA_StatusCode */) {
+    void *operationContext = (void*)(uintptr_t)context;
+    const UA_AddReferencesItem *item = (const UA_AddReferencesItem*)request;
+    UA_StatusCode *retval = (UA_StatusCode*)response;
+    beginModelChange(server);
+    Operation_addReference_inner(server, session, operationContext, item, retval);
+    endModelChange(server);
+}
+
 UA_Boolean
 Service_AddReferences(UA_Server *server, UA_Session *session,
-                      const UA_AddReferencesRequest *request,
-                      UA_AddReferencesResponse *response) {
+                      const void *request_, void *response_) {
+    const UA_AddReferencesRequest *request = (const UA_AddReferencesRequest*)request_;
+    UA_AddReferencesResponse *response = (UA_AddReferencesResponse*)response_;
     UA_LOG_DEBUG_SESSION(server->config.logging, session,
                          "Processing AddReferencesRequest");
     UA_LOCK_ASSERT(&server->serviceMutex);
@@ -2399,7 +2552,7 @@ Service_AddReferences(UA_Server *server, UA_Session *session,
 
     response->responseHeader.serviceResult =
         allocProcessServiceOperations(server, session,
-                                      (UA_ServiceOperation)Operation_addReference,
+                                      Operation_addReference,
                                       NULL, &request->referencesToAddSize,
                                       &UA_TYPES[UA_TYPES_ADDREFERENCESITEM],
                                       &response->resultsSize,
@@ -2436,8 +2589,9 @@ UA_Server_addReference(UA_Server *server, const UA_NodeId sourceId,
 /*********************/
 
 static void
-Operation_deleteReference(UA_Server *server, UA_Session *session, void *context,
-                          const UA_DeleteReferencesItem *item, UA_StatusCode *retval) {
+Operation_deleteReference_inner(UA_Server *server, UA_Session *session, void *context,
+                                const UA_DeleteReferencesItem *item,
+                                UA_StatusCode *retval) {
     UA_LOCK_ASSERT(&server->serviceMutex);
 
     /* Do not check access for server */
@@ -2485,6 +2639,8 @@ Operation_deleteReference(UA_Server *server, UA_Session *session, void *context,
     UA_NODESTORE_RELEASE(server, firstNode);
     if(*retval != UA_STATUSCODE_GOOD)
         return;
+    recordModelChangeEvent(server, &item->sourceNodeId,
+                      UA_MODELCHANGESTRUCTUREVERBMASK_REFERENCEDELETED);
 
     if(!item->deleteBidirectional || item->targetNodeId.serverIndex != 0)
         return;
@@ -2502,14 +2658,31 @@ Operation_deleteReference(UA_Server *server, UA_Session *session, void *context,
         if(secondNode) {
             *retval = UA_Node_deleteReference(secondNode, refTypeIndex, !item->isForward, &target2);
             UA_NODESTORE_RELEASE(server, secondNode);
+            if(*retval == UA_STATUSCODE_GOOD)
+                recordModelChangeEvent(server, &item->targetNodeId.nodeId,
+                                  UA_MODELCHANGESTRUCTUREVERBMASK_REFERENCEDELETED);
         }
     }
 }
 
+static void
+Operation_deleteReference(UA_Server *server, UA_Session *session,
+                          const void *context /* unused */,
+                          const void *request /* UA_DeleteReferencesItem */,
+                          void *response /* UA_StatusCode */) {
+    void *operationContext = (void*)(uintptr_t)context;
+    const UA_DeleteReferencesItem *item = (const UA_DeleteReferencesItem*)request;
+    UA_StatusCode *retval = (UA_StatusCode*)response;
+    beginModelChange(server);
+    Operation_deleteReference_inner(server, session, operationContext, item, retval);
+    endModelChange(server);
+}
+
 UA_Boolean
 Service_DeleteReferences(UA_Server *server, UA_Session *session,
-                         const UA_DeleteReferencesRequest *request,
-                         UA_DeleteReferencesResponse *response) {
+                         const void *request_, void *response_) {
+    const UA_DeleteReferencesRequest *request = (const UA_DeleteReferencesRequest*)request_;
+    UA_DeleteReferencesResponse *response = (UA_DeleteReferencesResponse*)response_;
     UA_LOG_DEBUG_SESSION(server->config.logging, session,
                          "Processing DeleteReferencesRequest");
     UA_LOCK_ASSERT(&server->serviceMutex);
@@ -2522,7 +2695,7 @@ Service_DeleteReferences(UA_Server *server, UA_Session *session,
 
     response->responseHeader.serviceResult =
         allocProcessServiceOperations(server, session,
-                                      (UA_ServiceOperation)Operation_deleteReference,
+                                      Operation_deleteReference,
                                       NULL, &request->referencesToDeleteSize,
                                       &UA_TYPES[UA_TYPES_DELETEREFERENCESITEM],
                                       &response->resultsSize,
@@ -2575,12 +2748,13 @@ struct SetInternalValueContext {
 
 static UA_StatusCode
 setInternalValueSourceCB(UA_Server *server, UA_Session *session,
-                         UA_VariableNode *vn, const void *ctx) {
+                         UA_Node *node, void *context /* SetInternalValueContext */) {
     const struct SetInternalValueContext *ivc =
-        (const struct SetInternalValueContext*)ctx;
+        (const struct SetInternalValueContext*)context;
+    UA_VariableNode *vn = &node->variableNode;
 
     /* Check the node class */
-    if(vn->head.nodeClass != UA_NODECLASS_VARIABLE)
+    if(node->head.nodeClass != UA_NODECLASS_VARIABLE)
         return UA_STATUSCODE_BADNODECLASSINVALID;
 
     /* Make a copy of the supplied value */
@@ -2626,7 +2800,7 @@ setVariableNode_internalValueSource(UA_Server *server, const UA_NodeId nodeId,
     return editNode(server, &server->adminSession, &nodeId,
                     UA_NODEATTRIBUTESMASK_VALUE, UA_REFERENCETYPESET_NONE,
                     UA_BROWSEDIRECTION_INVALID,
-                    (UA_EditNodeCallback)setInternalValueSourceCB, &ctx);
+                    setInternalValueSourceCB, &ctx);
 }
 
 UA_StatusCode
@@ -2644,18 +2818,19 @@ UA_Server_setVariableNode_internalValueSource(UA_Server *server, const UA_NodeId
 /*****************************/
 
 struct SetExternalValueContext {
-    UA_DataValue **value;
+    UA_atomic(UA_DataValue *)* value;
     const UA_ValueSourceNotifications *notifications;
 };
 
 static UA_StatusCode
 setExternalValueSourceCB(UA_Server *server, UA_Session *session,
-                         UA_VariableNode *vn, const void *ctx) {
+                         UA_Node *node, void *context /* SetExternalValueContext */) {
     const struct SetExternalValueContext *evc =
-        (const struct SetExternalValueContext*)ctx;
+        (const struct SetExternalValueContext*)context;
+    UA_VariableNode *vn = &node->variableNode;
 
     /* Check the node class */
-    if(vn->head.nodeClass != UA_NODECLASS_VARIABLE)
+    if(node->head.nodeClass != UA_NODECLASS_VARIABLE)
         return UA_STATUSCODE_BADNODECLASSINVALID;
 
     /* Clean the previous internal value */
@@ -2676,18 +2851,20 @@ setExternalValueSourceCB(UA_Server *server, UA_Session *session,
 
 UA_StatusCode
 UA_Server_setVariableNode_externalValueSource(UA_Server *server, const UA_NodeId nodeId,
-                                              UA_DataValue **value,
+                                              UA_DataValue** value,
                                               const UA_ValueSourceNotifications *notifications) {
     if(!server || !value || !*value)
         return UA_STATUSCODE_BADINVALIDARGUMENT;
     lockServer(server);
     struct SetExternalValueContext ctx;
-    ctx.value = value;
+    /* Cast through uintptr_t to silence a compiler warnings. We do not expose
+     * "value" as atomic in the public API. The fallout is too much atm. */
+    ctx.value = (UA_atomic(UA_DataValue*)*)(uintptr_t)value;
     ctx.notifications = notifications;
     UA_StatusCode res = editNode(server, &server->adminSession, &nodeId,
                                  UA_NODEATTRIBUTESMASK_VALUE, UA_REFERENCETYPESET_NONE,
                                  UA_BROWSEDIRECTION_INVALID,
-                                 (UA_EditNodeCallback)setExternalValueSourceCB, &ctx);
+                                 setExternalValueSourceCB, &ctx);
     unlockServer(server);
     return res;
 }
@@ -2698,11 +2875,12 @@ UA_Server_setVariableNode_externalValueSource(UA_Server *server, const UA_NodeId
 
 static UA_StatusCode
 setCallbackValueSourceCB(UA_Server *server, UA_Session *session,
-                         UA_VariableNode *vn, const void *ctx) {
-    const UA_CallbackValueSource *evs = (const UA_CallbackValueSource*)ctx;
+                         UA_Node *node, void *context /* UA_CallbackValueSource */) {
+    const UA_CallbackValueSource *evs = (const UA_CallbackValueSource*)context;
+    UA_VariableNode *vn = &node->variableNode;
 
     /* Check the node class */
-    if(vn->head.nodeClass != UA_NODECLASS_VARIABLE)
+    if(node->head.nodeClass != UA_NODECLASS_VARIABLE)
         return UA_STATUSCODE_BADNODECLASSINVALID;
 
     /* Clean up the internal value */
@@ -2721,7 +2899,7 @@ setVariableNode_callbackValueSource(UA_Server *server, const UA_NodeId nodeId,
                                     const UA_CallbackValueSource evs) {
     return editNode(server, &server->adminSession, &nodeId, UA_NODEATTRIBUTESMASK_VALUE,
                     UA_REFERENCETYPESET_NONE, UA_BROWSEDIRECTION_INVALID,
-                    (UA_EditNodeCallback)setCallbackValueSourceCB,
+                    setCallbackValueSourceCB,
                     (void*)(uintptr_t)&evs);
 }
 
@@ -2763,6 +2941,7 @@ UA_Server_addCallbackValueSourceVariableNode(UA_Server *server,
     }
 
     lockServer(server);
+    beginModelChange(server);
 
     /* Create the node and add it to the nodestore */
     UA_StatusCode retval = addNode_raw(server, &server->adminSession, nodeContext,
@@ -2783,8 +2962,12 @@ UA_Server_addCallbackValueSourceVariableNode(UA_Server *server,
 
     /* Call the constructors */
     retval = addNode_finish(server, &server->adminSession, outNewNodeId);
+    if(retval == UA_STATUSCODE_GOOD)
+        recordModelChangeEvent(server, outNewNodeId,
+                               UA_MODELCHANGESTRUCTUREVERBMASK_NODEADDED);
 
  cleanup:
+    endModelChange(server);
     unlockServer(server);
     if(outNewNodeId == &newNodeId)
         UA_NodeId_clear(&newNodeId);
@@ -2897,6 +3080,8 @@ UA_Server_addMethodNodeEx_finish(UA_Server *server, const UA_NodeId nodeId,
     retval = addNode_finish(server, &server->adminSession, &nodeId);
     if(retval != UA_STATUSCODE_GOOD)
         goto error;
+    recordModelChangeEvent(server, &nodeId,
+                           UA_MODELCHANGESTRUCTUREVERBMASK_NODEADDED);
 
     if(inputArgumentsOutNewNodeId != NULL) {
         UA_NodeId_copy(&inputArgsId, inputArgumentsOutNewNodeId);
@@ -2923,12 +3108,14 @@ UA_Server_addMethodNode_finish(UA_Server *server, const UA_NodeId nodeId,
                                size_t outputArgumentsSize,
                                const UA_Argument* outputArguments) {
     lockServer(server);
+    beginModelChange(server);
     UA_StatusCode retval =
         UA_Server_addMethodNodeEx_finish(server, nodeId, method,
                                          inputArgumentsSize, inputArguments,
                                          UA_NODEID_NULL, NULL,
                                          outputArgumentsSize, outputArguments,
                                          UA_NODEID_NULL, NULL);
+    endModelChange(server);
     unlockServer(server);
     return retval;
 }
@@ -2989,6 +3176,7 @@ UA_Server_addMethodNodeEx(UA_Server *server, const UA_NodeId requestedNewNodeId,
                           UA_NodeId *outputArgumentsOutNewNodeId,
                           void *nodeContext, UA_NodeId *outNewNodeId) {
     lockServer(server);
+    beginModelChange(server);
     UA_StatusCode res = addMethodNode(server, requestedNewNodeId,
                                       parentNodeId, referenceTypeId,
                                       browseName, &attr, method,
@@ -3000,6 +3188,7 @@ UA_Server_addMethodNodeEx(UA_Server *server, const UA_NodeId requestedNewNodeId,
                                       outputArgumentsRequestedNewNodeId,
                                       outputArgumentsOutNewNodeId,
                                       nodeContext, outNewNodeId);
+    endModelChange(server);
     unlockServer(server);
     return res;
 }
@@ -3023,7 +3212,8 @@ UA_Server_addMethodNode(UA_Server *server, const UA_NodeId requestedNewNodeId,
 
 static UA_StatusCode
 editMethodCallback(UA_Server *server, UA_Session* session,
-                   UA_Node *node, UA_MethodCallback methodCallback) {
+                   UA_Node *node, void *context /* UA_MethodCallback */) {
+    UA_MethodCallback methodCallback = *(UA_MethodCallback*)context;
     if(node->head.nodeClass != UA_NODECLASS_METHOD)
         return UA_STATUSCODE_BADNODECLASSINVALID;
     node->methodNode.method = methodCallback;
@@ -3037,8 +3227,7 @@ setMethodNode_callback(UA_Server *server,
     UA_LOCK_ASSERT(&server->serviceMutex);
     return editNode(server, &server->adminSession, &methodNodeId,
                     0, UA_REFERENCETYPESET_NONE, UA_BROWSEDIRECTION_INVALID,
-                    (UA_EditNodeCallback)editMethodCallback,
-                    (void*)(uintptr_t)methodCallback);
+                    editMethodCallback, &methodCallback);
 }
 
 UA_StatusCode
@@ -3088,7 +3277,8 @@ UA_Server_setAdminSessionContext(UA_Server *server,
 
 static UA_StatusCode
 setNodeTypeLifecycleCallback(UA_Server *server, UA_Session *session,
-                             UA_Node *node, UA_NodeTypeLifecycle *lifecycle) {
+                             UA_Node *node, void *context /* UA_NodeTypeLifecycle */) {
+    UA_NodeTypeLifecycle *lifecycle = (UA_NodeTypeLifecycle*)context;
     if(node->head.nodeClass == UA_NODECLASS_OBJECTTYPE) {
         node->objectTypeNode.lifecycle = *lifecycle;
     } else if(node->head.nodeClass == UA_NODECLASS_VARIABLETYPE) {
@@ -3104,7 +3294,7 @@ setNodeTypeLifecycle(UA_Server *server, UA_NodeId nodeId,
                      UA_NodeTypeLifecycle lifecycle) {
     return editNode(server, &server->adminSession, &nodeId, 0,
                     UA_REFERENCETYPESET_NONE, UA_BROWSEDIRECTION_INVALID,
-                    (UA_EditNodeCallback)setNodeTypeLifecycleCallback,
+                    setNodeTypeLifecycleCallback,
                     &lifecycle);
 }
 

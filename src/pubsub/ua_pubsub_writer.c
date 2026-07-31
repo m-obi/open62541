@@ -84,7 +84,7 @@ UA_DataSetWriter_setPubSubState(UA_PubSubManager *psm, UA_DataSetWriter *dsw,
                                 UA_PubSubState targetState) {
     /* Callback to modify the WriterGroup config and change the targetState
      * before the state machine executes */
-    UA_Server *server = psm->sc.server;
+    UA_Server *server = psm->drv.server;
     if(server->config.pubSubConfig.beforeStateChangeCallback) {
         server->config.pubSubConfig.
             beforeStateChangeCallback(server, dsw->head.identifier, &targetState);
@@ -160,7 +160,7 @@ UA_DataSetWriter_create(UA_PubSubManager *psm,
                         const UA_NodeId writerGroup, const UA_NodeId dataSet,
                         const UA_DataSetWriterConfig *dswConfig,
                         UA_NodeId *writerIdentifier) {
-    UA_LOCK_ASSERT(&psm->sc.server->serviceMutex);
+    UA_LOCK_ASSERT(&psm->drv.server->serviceMutex);
     if(!dswConfig)
         return UA_STATUSCODE_BADINVALIDARGUMENT;
 
@@ -221,7 +221,7 @@ UA_DataSetWriter_create(UA_PubSubManager *psm,
                 const UA_FieldMetaData *fmd = &pds->dataSetMetaData.fields[i];
                 const UA_DataType *type =
                     UA_findDataTypeWithCustom(&fmd->dataType,
-                                              psm->sc.server->config.customDataTypes);
+                                              psm->drv.server->config.customDataTypes);
                 if(type &&
                    (type->typeKind == UA_DATATYPEKIND_STRUCTURE ||
                     type->typeKind == UA_DATATYPEKIND_UNION ||
@@ -237,7 +237,7 @@ UA_DataSetWriter_create(UA_PubSubManager *psm,
             }
         }
 
-        if(psm->sc.server->config.pubSubConfig.enableDeltaFrames) {
+        if(psm->drv.server->config.pubSubConfig.enableDeltaFrames) {
             /* Initialize the queue for the last values */
             if(pds->fieldSize > 0) {
                 dsw->lastSamples = (UA_DataSetWriterSample*)
@@ -279,7 +279,7 @@ UA_DataSetWriter_create(UA_PubSubManager *psm,
 
     /* Add to the information model */
 #ifdef UA_ENABLE_PUBSUB_INFORMATIONMODEL
-    res |= addDataSetWriterRepresentation(psm->sc.server, dsw);
+    res |= addDataSetWriterRepresentation(psm->drv.server, dsw);
 #else
     UA_PubSubManager_generateUniqueNodeId(psm, &dsw->head.identifier);
 #endif
@@ -293,13 +293,16 @@ UA_DataSetWriter_create(UA_PubSubManager *psm,
 
     /* Notify the application that a new Writer was created.
      * This may internally adjust the config */
-    UA_Server *server = psm->sc.server;
+    UA_Server *server = psm->drv.server;
     if(server->config.pubSubConfig.componentLifecycleCallback) {
         res = server->config.pubSubConfig.
             componentLifecycleCallback(server, dsw->head.identifier,
                                        UA_PUBSUBCOMPONENT_DATASETWRITER, false);
         if(res != UA_STATUSCODE_GOOD) {
-            UA_DataSetWriter_remove(psm, dsw);
+            /* The app refused the component; free without re-asking the
+             * lifecycle callback (it would re-reject and leak the writer). */
+            UA_PubSubComponent_freeWithoutLifecycleCallback(
+                psm, dsw, UA_PUBSUBCOMPONENT_DATASETWRITER);
             return res;
         }
     }
@@ -320,7 +323,7 @@ UA_DataSetWriter_create(UA_PubSubManager *psm,
 
 UA_StatusCode
 UA_DataSetWriter_remove(UA_PubSubManager *psm, UA_DataSetWriter *dsw) {
-    UA_LOCK_ASSERT(&psm->sc.server->serviceMutex);
+    UA_LOCK_ASSERT(&psm->drv.server->serviceMutex);
 
     UA_WriterGroup *wg = dsw->linkedWriterGroup;
     UA_assert(wg);
@@ -334,7 +337,7 @@ UA_DataSetWriter_remove(UA_PubSubManager *psm, UA_DataSetWriter *dsw) {
     }
 
     /* Check with the application if we can remove */
-    UA_Server *server = psm->sc.server;
+    UA_Server *server = psm->drv.server;
     if(server->config.pubSubConfig.componentLifecycleCallback) {
         UA_StatusCode res = server->config.pubSubConfig.
             componentLifecycleCallback(server, dsw->head.identifier,
@@ -348,7 +351,7 @@ UA_DataSetWriter_remove(UA_PubSubManager *psm, UA_DataSetWriter *dsw) {
 
     /* Remove from information model */
 #ifdef UA_ENABLE_PUBSUB_INFORMATIONMODEL
-    deleteNode(psm->sc.server, dsw->head.identifier, true);
+    deleteNode(psm->drv.server, dsw->head.identifier, true);
 #endif
 
     /* Remove DataSetWriter from group */
@@ -357,7 +360,7 @@ UA_DataSetWriter_remove(UA_PubSubManager *psm, UA_DataSetWriter *dsw) {
 
     UA_LOG_INFO_PUBSUB(psm->logging, dsw, "Writer deleted");
 
-    if(psm->sc.server->config.pubSubConfig.enableDeltaFrames) {
+    if(psm->drv.server->config.pubSubConfig.enableDeltaFrames) {
         /* Delete lastSamples store */
         for(size_t i = 0; i < dsw->lastSamplesCount; i++) {
             UA_DataValue_clear(&dsw->lastSamples[i].value);
@@ -422,7 +425,7 @@ UA_PubSubDataSetWriter_generateKeyFrameMessage(UA_PubSubManager *psm,
             (u64)UA_DATASETFIELDCONTENTMASK_SERVERPICOSECONDS) == 0)
             dfv->hasServerPicoseconds = false;
 
-        if(psm->sc.server->config.pubSubConfig.enableDeltaFrames) {
+        if(psm->drv.server->config.pubSubConfig.enableDeltaFrames) {
             /* Update lastValue store */
             UA_DataValue_clear(&dsw->lastSamples[counter].value);
             UA_DataValue_copy(dfv, &dsw->lastSamples[counter].value);
@@ -507,7 +510,7 @@ UA_PubSubDataSetWriter_generateDeltaFrameMessage(UA_PubSubManager *psm,
             dff->value.hasSourceTimestamp = false;
         if(((u64)dsw->config.dataSetFieldContentMask &
             (u64)UA_DATASETFIELDCONTENTMASK_SOURCEPICOSECONDS) == 0)
-            dff->value.hasServerPicoseconds = false;
+            dff->value.hasSourcePicoseconds = false;
         if(((u64)dsw->config.dataSetFieldContentMask &
             (u64)UA_DATASETFIELDCONTENTMASK_SERVERTIMESTAMP) == 0)
             dff->value.hasServerTimestamp = false;
@@ -525,7 +528,7 @@ UA_StatusCode
 UA_DataSetWriter_generateDataSetMessage(UA_PubSubManager *psm,
                                         UA_DataSetWriter *dsw,
                                         UA_DataSetMessage *dataSetMessage) {
-    UA_EventLoop *el = psm->sc.server->config.eventLoop;
+    UA_EventLoop *el = psm->drv.server->config.eventLoop;
 
     /* Heartbeat message if no pds is connected */
     UA_PublishedDataSet *pds = dsw->connectedDataSet;
@@ -678,7 +681,7 @@ UA_DataSetWriter_generateDataSetMessage(UA_PubSubManager *psm,
 
     /* JSON does not differ between deltaframes and keyframes, only keyframes
      * are currently used. */
-    if(dsm && psm->sc.server->config.pubSubConfig.enableDeltaFrames) {
+    if(dsm && psm->drv.server->config.pubSubConfig.enableDeltaFrames) {
         /* Check if the PublishedDataSet version has changed -> if yes flush the
          * lastValue store and send a KeyFrame */
         if(dsw->connectedDataSetVersion.majorVersion !=

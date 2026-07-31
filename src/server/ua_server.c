@@ -22,6 +22,10 @@
 
 #include "ua_server_internal.h"
 
+#ifdef UA_ENABLE_DISCOVERY
+#include "ua_discovery.h"
+#endif
+
 #ifdef UA_ENABLE_SUBSCRIPTIONS
 #include "ua_subscription.h"
 #endif
@@ -151,7 +155,8 @@ UA_Server_getNamespaceByIndex(UA_Server *server, const size_t namespaceIndex,
 
 UA_StatusCode
 UA_Server_forEachChildNodeCall(UA_Server *server, UA_NodeId parentNodeId,
-                               UA_NodeIteratorCallback callback, void *handle) {
+                               UA_ServerNodeIteratorCallback callback,
+                               void *handle) {
     UA_BrowseDescription bd;
     UA_BrowseDescription_init(&bd);
     bd.nodeId = parentNodeId;
@@ -174,238 +179,112 @@ cleanup:
     return res;
 }
 
-/********************/
-/* GDS Transaction  */
-/********************/
+/***********/
+/* Drivers */
+/***********/
 
-UA_StatusCode
-UA_GDSTransaction_init(UA_GDSTransaction *transaction, UA_Server *server, const UA_NodeId sessionId) {
-    if(!transaction || !server)
+static UA_StatusCode
+addDriver(UA_Server *server, UA_Driver *drv) {
+    UA_LOCK_ASSERT(&server->serviceMutex);
+
+    /* Did the allocation of the driver fail? */
+    if(!drv)
         return UA_STATUSCODE_BADINTERNALERROR;
 
-    UA_ByteString csr = UA_BYTESTRING_NULL;
-    if(transaction->localCsrCertificate.length > 0)
-        csr = transaction->localCsrCertificate;
-
-    memset(transaction, 0, sizeof(UA_GDSTransaction));
-
-    transaction->state = UA_GDSTRANSACTIONSTATE_PENDING;
-    UA_NodeId_copy(&sessionId, &transaction->sessionId);
-    transaction->server = server;
-    transaction->localCsrCertificate = csr;
-
-    return UA_STATUSCODE_GOOD;
-}
-
-UA_CertificateGroup*
-UA_GDSTransaction_getCertificateGroup(UA_GDSTransaction *transaction,
-                                      const UA_CertificateGroup *certGroup) {
-#ifdef UA_ENABLE_ENCRYPTION
-    if(!transaction || !certGroup)
-        return NULL;
-
-    /* Check if transaction was initialized */
-    if(transaction->state != UA_GDSTRANSACTIONSTATE_PENDING)
-        return NULL;
-
-    for(size_t i = 0; i < transaction->certGroupSize; i++) {
-        UA_CertificateGroup *group = &transaction->certGroups[i];
-        if(UA_NodeId_equal(&group->certificateGroupId, &certGroup->certificateGroupId))
-            return group;
+    /* A server can expose the GDS PushManagement information model only once. */
+    if(drv->driverType == UA_DRIVERTYPE_GDS_RECEIVER) {
+        UA_Driver *registered = server->drivers;
+        while(registered) {
+            if(registered->driverType == UA_DRIVERTYPE_GDS_RECEIVER) {
+                UA_LOG_ERROR(server->config.logging, UA_LOGCATEGORY_SERVER,
+                             "Cannot add the driver \"%S\". A GDS Receiver "
+                             "driver is already configured",
+                             drv->name);
+                return UA_STATUSCODE_BADALREADYEXISTS;
+            }
+            registered = registered->next;
+        }
     }
 
-    /* If the certGroup does not exist, create a new one */
-    transaction->certGroups = (UA_CertificateGroup*)UA_realloc(transaction->certGroups, (transaction->certGroupSize + 1) * sizeof(UA_CertificateGroup));
-    if(!transaction->certGroups)
-        return NULL;
+    /* If undefined, set the backpointer to the current server */
+    if(!drv->server)
+        drv->server = server;
 
-    transaction->certGroupSize++;
-
-    memset(&transaction->certGroups[transaction->certGroupSize-1], 0, sizeof(UA_CertificateGroup));
-
-    UA_TrustListDataType trustList;
-    UA_TrustListDataType_init(&trustList);
-    trustList.specifiedLists = UA_TRUSTLISTMASKS_ALL;
-    certGroup->getTrustList((UA_CertificateGroup*)(uintptr_t)certGroup, &trustList);
-
-    /* Set up the parameters */
-    static UA_THREAD_LOCAL UA_KeyValuePair params[1] = {
-        {{0, UA_STRING_STATIC("max-trust-listsize")}, {0}}
-    };
-    UA_KeyValueMap paramsMap = {1, params};
-
-    UA_ServerConfig *config = UA_Server_getConfig(transaction->server);
-    UA_Variant_setScalar(&params[0].value, &config->maxTrustListSize,
-                         &UA_TYPES[UA_TYPES_UINT32]);
-
-    UA_CertificateGroup_Memorystore(&transaction->certGroups[transaction->certGroupSize-1],
-        (UA_NodeId*)(uintptr_t)&certGroup->certificateGroupId, &trustList, certGroup->logging, &paramsMap);
-
-    UA_TrustListDataType_clear(&trustList);
-
-    return &transaction->certGroups[transaction->certGroupSize-1];
-#else
-    return NULL;
-#endif
-}
-
-UA_StatusCode
-UA_GDSTransaction_addCertificateInfo(UA_GDSTransaction *transaction,
-                                     const UA_NodeId certificateGroupId,
-                                     const UA_NodeId certificateTypeId,
-                                     const UA_ByteString *certificate,
-                                     const UA_ByteString *privateKey) {
-    if(!transaction || !certificate)
+    /* Check that the driver is not configured for a different server */
+    if(drv->server != server) {
+        UA_LOG_ERROR(server->config.logging, UA_LOGCATEGORY_SERVER,
+                     "Cannot add the driver \"%S\". "
+                     "It is configured for a different server",
+                     drv->name);
         return UA_STATUSCODE_BADINTERNALERROR;
-
-    /* Check if transaction was initialized */
-    if(transaction->state != UA_GDSTRANSACTIONSTATE_PENDING)
-        return UA_STATUSCODE_BADINVALIDSTATE;
-
-    /* Check if an entry with certificateGroupId and certificateTypeId already exists */
-    for(size_t i = 0; i < transaction->certificateInfosSize; i++) {
-        UA_GDSCertificateInfo *certInfo = &transaction->certificateInfos[i];
-
-        if(!UA_NodeId_equal(&certInfo->certificateGroup, &certificateGroupId) ||
-           !UA_NodeId_equal(&certInfo->certificateType, &certificateTypeId))
-            continue;
-
-        UA_ByteString_clear(&certInfo->certificate);
-        UA_ByteString_clear(&certInfo->privateKey);
-
-        UA_ByteString_copy(certificate, &certInfo->certificate);
-        certInfo->privateKey = UA_BYTESTRING_NULL;
-        if(privateKey)
-            UA_ByteString_copy(privateKey, &certInfo->privateKey);
-
-        return UA_STATUSCODE_GOOD;
     }
 
-    UA_GDSCertificateInfo *newCertInfos = (UA_GDSCertificateInfo *)UA_realloc(transaction->certificateInfos,
-        (transaction->certificateInfosSize + 1) * sizeof(UA_GDSCertificateInfo));
-    if(!newCertInfos)
-        return UA_STATUSCODE_BADOUTOFMEMORY;
-
-    transaction->certificateInfos = newCertInfos;
-
-    UA_GDSCertificateInfo *newCertInfo = &transaction->certificateInfos[transaction->certificateInfosSize];
-    UA_ByteString_copy(certificate, &newCertInfo->certificate);
-    UA_NodeId_copy(&certificateGroupId, &newCertInfo->certificateGroup);
-    UA_NodeId_copy(&certificateTypeId, &newCertInfo->certificateType);
-    newCertInfo->privateKey = UA_BYTESTRING_NULL;
-    if(privateKey)
-        UA_ByteString_copy(privateKey, &newCertInfo->privateKey);
-
-    transaction->certificateInfosSize++;
-
-    return UA_STATUSCODE_GOOD;
-}
-
-void UA_GDSTransaction_clear(UA_GDSTransaction *transaction) {
-    if(!transaction)
-        return;
-
-    transaction->state = UA_GDSTRANSACTIONSTATE_FRESH;
-    transaction->server = NULL;
-    UA_NodeId_clear(&transaction->sessionId);
-    UA_ByteString_clear(&transaction->localCsrCertificate);
-
-    if(transaction->certGroups) {
-        for(size_t i = 0; i < transaction->certGroupSize; i++) {
-            transaction->certGroups[i].clear(&transaction->certGroups[i]);
-        }
-        UA_free(transaction->certGroups);
-        transaction->certGroupSize = 0;
-        transaction->certGroups = NULL;
-    }
-
-    if(transaction->certificateInfos) {
-        for(size_t i = 0; i < transaction->certificateInfosSize; i++) {
-            UA_ByteString_clear(&transaction->certificateInfos[i].certificate);
-            UA_ByteString_clear(&transaction->certificateInfos[i].privateKey);
-            UA_NodeId_clear(&transaction->certificateInfos[i].certificateGroup);
-            UA_NodeId_clear(&transaction->certificateInfos[i].certificateType);
-        }
-        UA_free(transaction->certificateInfos);
-        transaction->certificateInfosSize = 0;
-        transaction->certificateInfos = NULL;
-    }
-}
-
-void UA_GDSTransaction_delete(UA_GDSTransaction *transaction) {
-    UA_GDSTransaction_clear(transaction);
-    UA_free(transaction);
-}
-
-#ifndef UA_ENABLE_GDS_PUSHMANAGEMENT
-/* Minimal stub: when GDS push management is not compiled in,
- * only the embedded transaction needs to be cleared. */
-void
-UA_GDSManager_clear(UA_GDSManager *gdsManager) {
-    if(!gdsManager)
-        return;
-    gdsManager->checkSessionCallbackId = 0;
-    UA_GDSTransaction_clear(&gdsManager->transaction);
-}
-#endif
-
-/*********************/
-/* Server Components */
-/*********************/
-
-enum ZIP_CMP
-cmpServerComponent(const UA_UInt64 *a, const UA_UInt64 *b) {
-    if(*a == *b)
-        return ZIP_CMP_EQ;
-    return (*a < *b) ? ZIP_CMP_LESS : ZIP_CMP_MORE;
-}
-
-void
-addServerComponent(UA_Server *server, UA_ServerComponent *sc,
-                   UA_UInt64 *identifier) {
-    if(!sc)
-        return;
-
-    sc->identifier = ++server->serverComponentIds;
-    ZIP_INSERT(UA_ServerComponentTree, &server->serverComponents, sc);
+    /* Add to the linked list */
+    drv->next = server->drivers;
+    server->drivers = drv;
 
     /* Start the component if the server is started */
-    if(server->state == UA_LIFECYCLESTATE_STARTED && sc->start)
-        sc->start(sc, server);
+    if(server->state == UA_LIFECYCLESTATE_STARTED && drv->start)
+        drv->start(drv);
 
-    if(identifier)
-        *identifier = sc->identifier;
+    return UA_STATUSCODE_GOOD;
 }
 
-static void *
-findServerComponent(void *context, UA_ServerComponent *sc) {
-    UA_String *name = (UA_String*)context;
-    return (UA_String_equal(&sc->name, name)) ? sc : NULL;
+UA_StatusCode
+UA_Server_addDriver(UA_Server *server, UA_Driver *drv) {
+    UA_LOCK(&server->serviceMutex);
+    UA_StatusCode res = addDriver(server, drv);
+    UA_UNLOCK(&server->serviceMutex);
+    return res;
 }
 
-UA_ServerComponent *
-getServerComponentByName(UA_Server *server, UA_String name) {
-    return (UA_ServerComponent*)
-        ZIP_ITER(UA_ServerComponentTree, &server->serverComponents,
-                 findServerComponent, &name);
+UA_StatusCode
+UA_Server_removeDriver(UA_Server *server, UA_Driver *drv) {
+    UA_LOCK(&server->serviceMutex);
+
+    if(drv->state != UA_LIFECYCLESTATE_STOPPED) {
+        UA_LOG_ERROR(server->config.logging, UA_LOGCATEGORY_SERVER,
+                     "Cannot remove the driver \"%S\". "
+                     "It is not fully stopped.", drv->name);
+        UA_UNLOCK(&server->serviceMutex);
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
+
+    UA_StatusCode res = UA_STATUSCODE_BADNOTFOUND;
+    UA_Driver **prev = &server->drivers;
+    for(UA_Driver *drv2 = server->drivers; drv2;
+        prev = &drv2->next, drv2 = drv2->next) {
+        if(drv2 == drv) {
+            *prev = drv->next;
+            res = UA_STATUSCODE_GOOD;
+            break;
+        }
+    }
+
+    UA_UNLOCK(&server->serviceMutex);
+    return res;
 }
 
-static void *
-startServerComponent(void *server, UA_ServerComponent *sc) {
-    sc->start(sc, (UA_Server*)server);
-    return NULL;
+UA_Driver *
+UA_Server_getDrivers(UA_Server *server) {
+    return server->drivers;
 }
 
-static void *
-stopServerComponent(void *_, UA_ServerComponent *sc) {
-    sc->stop(sc);
-    return NULL;
+static void
+stopDrivers(UA_Server *server) {
+    for(UA_Driver *drv = server->drivers; drv; drv = drv->next) {
+        drv->stop(drv);
+    }
 }
 
-/* ZIP_ITER returns NULL only if all components are stopped */
-static void *
-checkServerComponent(void *_, UA_ServerComponent *sc) {
-    return (sc->state == UA_LIFECYCLESTATE_STOPPED) ? NULL : (void*)0x01;
+static UA_Boolean
+testStoppedCondition(UA_Server *server) {
+    /* Check if there are remaining drivers that did not fully stop */
+    for(UA_Driver *drv = server->drivers; drv; drv = drv->next) {
+        if(drv->state != UA_LIFECYCLESTATE_STOPPED)
+            return false;
+    }
+    return true;
 }
 
 /********************/
@@ -436,17 +315,18 @@ UA_Server_delete(UA_Server *server) {
     /* Remove subscriptions without a session */
     UA_Subscription *sub, *sub_tmp;
     LIST_FOREACH_SAFE(sub, &server->subscriptions, serverListEntry, sub_tmp) {
-        UA_Subscription_delete(server, sub);
+        UA_Subscription_delete(server, sub, true);
     }
-
-#ifdef UA_ENABLE_SUBSCRIPTIONS_ALARMS_CONDITIONS
-    UA_ConditionList_delete(server);
-#endif
 
 #endif
 
 #if UA_MULTITHREADING >= 100
     UA_AsyncManager_clear(&server->asyncManager, server);
+#endif
+
+#ifdef UA_ENABLE_SUBSCRIPTIONS_EVENTS
+    UA_assert(server->modelChangeDepth == 0);
+    UA_ModelChangeAccumulator_clear(&server->modelChanges);
 #endif
 
     /* Clean up the Admin Session */
@@ -457,20 +337,38 @@ UA_Server_delete(UA_Server *server) {
     UA_assert(server->subscriptionsSize == 0);
 #endif
 
-    /* Remove all server components (all stopped by now) */
-    UA_ServerComponent *top;
-    while((top = ZIP_ROOT(&server->serverComponents))) {
+    /* Remove all drivers (all stopped by now) */
+    UA_Driver *top;
+    while((top = server->drivers)) {
+        server->drivers = top->next;
         UA_assert(top->state == UA_LIFECYCLESTATE_STOPPED);
-        top->clear(top);
-        ZIP_REMOVE(UA_ServerComponentTree, &server->serverComponents, top);
-        UA_free(top);
+        top->free(top);
     }
 
     unlockServer(server); /* The timer has its own mutex */
 
-#ifdef UA_ENABLE_RBAC
     /* Clean up internal RBAC state (before config clear) */
+#ifdef UA_ENABLE_RBAC
     UA_Server_cleanupRBAC(server);
+#endif
+
+    /* Clean up Discovery entries  */
+#ifdef UA_ENABLE_DISCOVERY
+    /* Remove registered servers. Don't notify the application here */
+    RegisteredServerRecord *rs, *rs_tmp;
+    LIST_FOREACH_SAFE(rs, &server->registeredServers, pointers, rs_tmp) {
+        LIST_REMOVE(rs, pointers);
+        UA_RegisteredServer_clear(&rs->registeredServer);
+        UA_free(rs);
+    }
+    server->registeredServersSize = 0;
+
+    /* Remove ServersOnNetwork */
+    UA_Array_delete(server->serversOnNetwork,
+                    server->serversOnNetworkSize,
+                    &UA_TYPES[UA_TYPES_SERVERONNETWORK]);
+    server->serversOnNetwork = NULL;
+    server->serversOnNetworkSize = 0;
 #endif
 
     /* Clean up the config */
@@ -479,8 +377,6 @@ UA_Server_delete(UA_Server *server) {
 #if UA_MULTITHREADING >= 100
     UA_LOCK_DESTROY(&server->serviceMutex);
 #endif
-
-    UA_GDSManager_clear(&server->gdsManager);
 
     /* Clean up the custom datatypes */
     if(server->customTypes_internal != NULL) {
@@ -505,6 +401,9 @@ serverHouseKeeping(UA_Server *server, void *_) {
     lockServer(server);
     UA_EventLoop *el = server->config.eventLoop;
     cleanupSessions(server, el->dateTime_nowMonotonic(el));
+#ifdef UA_ENABLE_DISCOVERY
+    cleanupRegisteredServers(server);
+#endif
     unlockServer(server);
 }
 
@@ -544,6 +443,11 @@ UA_Server_init(UA_Server *server) {
     server->adminSession.validTill = UA_INT64_MAX;
     server->adminSession.sessionName = UA_STRING_ALLOC("Administrator");
 
+#ifdef UA_ENABLE_SUBSCRIPTIONS_EVENTS
+    UA_ModelChangeAccumulator_init(&server->modelChanges);
+    server->modelChangeSuppressionDepth = 1;
+#endif
+
 #ifdef UA_ENABLE_SUBSCRIPTIONS
     /* Initialize the adminSubscription */
     server->adminSubscription = UA_Subscription_new();
@@ -575,8 +479,8 @@ UA_Server_init(UA_Server *server) {
 #endif
 
     /* Initialize namespace 0 */
-#ifdef UA_GENERATED_NAMESPACE_ZERO
-    /* Standard configuration: generate NS0 nodes at runtime */
+#if defined(UA_GENERATED_NAMESPACE_ZERO) || defined(UA_NAMESPACE_ZERO_MINIMAL)
+    /* Generate NS0 nodes at runtime or create the minimal NS0 */
     res = initNS0(server);
 #else
     /* NONE configuration: NS0 pre-loaded by external nodestore (e.g., ROM).
@@ -584,11 +488,6 @@ UA_Server_init(UA_Server *server) {
     res = initNS0_dataSources(server);
 #endif
     UA_CHECK_STATUS(res, goto cleanup);
-
-#ifdef UA_ENABLE_GDS_PUSHMANAGEMENT
-    res = initNS0PushManagement(server);
-    UA_CHECK_STATUS(res, goto cleanup);
-#endif
 
 #ifdef UA_ENABLE_NODESET_INJECTOR
     res = UA_Server_injectNodesets(server);
@@ -604,18 +503,36 @@ UA_Server_init(UA_Server *server) {
     UA_CHECK_STATUS(res, goto cleanup);
 #endif
 
-    /* Initialize the binay protocol support */
-    addServerComponent(server, UA_BinaryProtocolManager_new(server), NULL);
+    /* Initialize the binary protocol support */
+    server->binaryDriver = UA_BinaryProtocolManager_new();
+    res = addDriver(server, server->binaryDriver);
+    UA_CHECK_STATUS(res, goto cleanup);
+
+    /* Initialize the reverse connect binary protocol support */
+    server->reverseBinaryDriver = UA_ReverseBinaryProtocolManager_new();
+    res = addDriver(server, server->reverseBinaryDriver);
+    UA_CHECK_STATUS(res, goto cleanup);
 
     /* Initialized Discovery */
 #ifdef UA_ENABLE_DISCOVERY
-    addServerComponent(server, UA_DiscoveryManager_new(), NULL);
+    server->discoveryDriver = UA_DiscoveryManager_new();
+    res = addDriver(server, server->discoveryDriver);
+    UA_CHECK_STATUS(res, goto cleanup);
+
+    UA_EventLoop *el = server->config.eventLoop;
+    server->lastCounterResetTime = el->dateTime_now(el);
+    server->serversOnNetworkRecordCounter = 1;
+    server->serversOnNetworkSize = 0;
+    server->serversOnNetwork = NULL;
 #endif
 
     /* Initialize PubSub */
 #ifdef UA_ENABLE_PUBSUB
-    if(server->config.pubsubEnabled)
-        addServerComponent(server, UA_PubSubManager_new(server), NULL);
+    if(server->config.pubsubEnabled) {
+        server->pubSubDriver = UA_PubSubManager_new(server);
+        res = addDriver(server, server->pubSubDriver);
+        UA_CHECK_STATUS(res, goto cleanup);
+    }
 #endif
 
     /* For all custom datatypes, check if they are represented in the
@@ -699,16 +616,12 @@ setServerShutdown(UA_Server *server) {
                    (int)server->config.shutdownDelay);
 
     UA_EventLoop *el = server->config.eventLoop;
-    server->endTime = el->dateTime_now(el) + (UA_DateTime)(server->config.shutdownDelay * UA_DATETIME_MSEC);
+    server->endTime = el->dateTime_now(el) +
+        (UA_DateTime)(server->config.shutdownDelay * UA_DATETIME_MSEC);
 
-    /* Call the application notification callback */
-    UA_ServerConfig *config = &server->config;
-    if(config->lifecycleNotificationCallback)
-        config->lifecycleNotificationCallback(server, UA_APPLICATIONNOTIFICATIONTYPE_LIFECYCLE_SHUTDOWN,
-                                              UA_KEYVALUEMAP_NULL);
-    if(config->globalNotificationCallback)
-        config->globalNotificationCallback(server, UA_APPLICATIONNOTIFICATIONTYPE_LIFECYCLE_SHUTDOWN,
-                                           UA_KEYVALUEMAP_NULL);
+    /* Call the application notification callbacks */
+    UA_ApplicationNotificationType nt = UA_APPLICATIONNOTIFICATIONTYPE_LIFECYCLE_SHUTDOWN;
+    notifyApplication(server, nt, UA_KEYVALUEMAP_NULL);
 
     return false;
 }
@@ -928,185 +841,6 @@ UA_Server_removeCertificates(UA_Server *server,
     return UA_STATUSCODE_GOOD;
 }
 
-typedef struct UpdateCertInfo {
-    UA_Server *server;
-    UA_NodeId certificateTypeId;
-} UpdateCertInfo;
-
-static void
-secureChannel_delayedClose(void *application, void *context) {
-    UA_DelayedCallback *dc = (UA_DelayedCallback*)context;
-    UpdateCertInfo *info = (UpdateCertInfo*)application;
-
-    UA_SecureChannel *channel;
-    TAILQ_FOREACH(channel, &info->server->channels, serverEntry) {
-        const UA_SecurityPolicy *policy = channel->securityPolicy;
-        if(UA_NodeId_equal(&policy->certificateTypeId, &(info->certificateTypeId)))
-            UA_SecureChannel_shutdown(channel, UA_SHUTDOWNREASON_CLOSE);
-    }
-    UA_NodeId_clear(&(info->certificateTypeId));
-    UA_free(info);
-    UA_free(dc);
-}
-
-UA_StatusCode
-UA_Server_updateCertificate(UA_Server *server,
-                            const UA_NodeId certificateGroupId,
-                            const UA_NodeId certificateTypeId,
-                            const UA_ByteString certificate,
-                            const UA_ByteString *privateKey) {
-    if(!server)
-        return UA_STATUSCODE_BADINTERNALERROR;
-
-    lockServer(server);
-
-    if(server->gdsManager.transaction.state == UA_GDSTRANSACTIONSTATE_PENDING) {
-        unlockServer(server);
-        return UA_STATUSCODE_BADTRANSACTIONPENDING;
-    }
-
-    UA_NodeId defaultApplicationGroup = UA_NODEID_NUMERIC(0, UA_NS0ID_SERVERCONFIGURATION_CERTIFICATEGROUPS_DEFAULTAPPLICATIONGROUP);
-    UA_NodeId certGroupId = certificateGroupId;
-    if(UA_NodeId_isNull(&certGroupId)) {
-        /* Use default value if argument is empty */
-        certGroupId = defaultApplicationGroup;
-    }
-    /* The server currently only supports the DefaultApplicationGroup */
-    if(!UA_NodeId_equal(&certGroupId, &defaultApplicationGroup)) {
-        unlockServer(server);
-        return UA_STATUSCODE_BADINVALIDARGUMENT;
-    }
-
-    /* The server currently only supports the following certificate type */
-    /* UA_NodeId certTypRsaMin = UA_NODEID_NUMERIC(0, UA_NS0ID_RSAMINAPPLICATIONCERTIFICATETYPE); */
-    UA_NodeId certTypRsaSha256 = UA_NODEID_NUMERIC(0, UA_NS0ID_RSASHA256APPLICATIONCERTIFICATETYPE);
-    if(!UA_NodeId_equal(&certificateTypeId, &certTypRsaSha256)) {
-        unlockServer(server);
-        return UA_STATUSCODE_BADINVALIDARGUMENT;
-    }
-
-    UA_ByteString newPrivateKey = UA_BYTESTRING_NULL;
-    if(privateKey) {
-        if(UA_CertificateUtils_checkKeyPair(&certificate, privateKey) != UA_STATUSCODE_GOOD) {
-            unlockServer(server);
-            return UA_STATUSCODE_BADNOTSUPPORTED;
-        }
-        newPrivateKey = *privateKey;
-    }
-
-    UA_StatusCode retval = UA_STATUSCODE_GOOD;
-    for(size_t i = 0; i < server->config.endpointsSize; i++) {
-        UA_EndpointDescription *ed = &server->config.endpoints[i];
-        UA_SecurityPolicy *sp = getSecurityPolicyByUri(server,
-                            &server->config.endpoints[i].securityPolicyUri);
-        UA_CHECK_MEM(sp, unlockServer(server); return UA_STATUSCODE_BADINTERNALERROR);
-
-        if(!UA_NodeId_equal(&sp->certificateTypeId, &certificateTypeId))
-            continue;
-
-        retval = sp->updateCertificate(sp, certificate, newPrivateKey);
-        if(retval != UA_STATUSCODE_GOOD) {
-            unlockServer(server);
-            return retval;
-        }
-
-        UA_ByteString_clear(&ed->serverCertificate);
-        UA_ByteString_copy(&certificate, &ed->serverCertificate);
-    }
-
-    UA_DelayedCallback *dc = (UA_DelayedCallback*)UA_calloc(1, sizeof(UA_DelayedCallback));
-    if(!dc) {
-        unlockServer(server);
-        return UA_STATUSCODE_BADOUTOFMEMORY;
-    }
-
-    UpdateCertInfo *certInfo = (UpdateCertInfo*)UA_calloc(1, sizeof(UpdateCertInfo));
-    certInfo->server = server;
-    UA_NodeId_copy(&certificateTypeId, &(certInfo->certificateTypeId));
-
-    dc->callback = secureChannel_delayedClose;
-    dc->application = certInfo;
-    dc->context = dc;
-
-    UA_EventLoop *el = server->config.eventLoop;
-    el->addDelayedCallback(el, dc);
-
-    unlockServer(server);
-    return UA_STATUSCODE_GOOD;
-}
-
-UA_StatusCode
-UA_Server_createSigningRequest(UA_Server *server,
-                               const UA_NodeId certificateGroupId,
-                               const UA_NodeId certificateTypeId,
-                               const UA_String *subjectName,
-                               const UA_Boolean *regenerateKey,
-                               const UA_ByteString *nonce,
-                               UA_ByteString *csr) {
-    if(!server || !csr)
-        return UA_STATUSCODE_BADINTERNALERROR;
-
-    UA_StatusCode retval = UA_STATUSCODE_GOOD;
-    UA_NodeId defaultApplicationGroup = UA_NODEID_NUMERIC(0, UA_NS0ID_SERVERCONFIGURATION_CERTIFICATEGROUPS_DEFAULTAPPLICATIONGROUP);
-    UA_NodeId certGroupId = certificateGroupId;
-    if(UA_NodeId_isNull(&certGroupId)) {
-        /* Use default value if argument is empty */
-        certGroupId = defaultApplicationGroup;
-    }
-    /* The server currently only supports the DefaultApplicationGroup */
-    if(!UA_NodeId_equal(&certGroupId, &defaultApplicationGroup))
-        return UA_STATUSCODE_BADINVALIDARGUMENT;
-
-    /* The server currently only supports RSA CertificateType */
-    UA_NodeId rsaShaCertificateType = UA_NODEID_NUMERIC(0, UA_NS0ID_RSASHA256APPLICATIONCERTIFICATETYPE);
-    UA_NodeId rsaMinCertificateType = UA_NODEID_NUMERIC(0,UA_NS0ID_RSAMINAPPLICATIONCERTIFICATETYPE);
-    if(!UA_NodeId_equal(&certificateTypeId, &rsaShaCertificateType) &&
-       !UA_NodeId_equal(&certificateTypeId, &rsaMinCertificateType))
-        return UA_STATUSCODE_BADINVALIDARGUMENT;
-
-    UA_CertificateGroup certGroup = server->config.secureChannelPKI;
-
-    if(!UA_NodeId_equal(&certGroup.certificateGroupId, &defaultApplicationGroup))
-        return UA_STATUSCODE_BADINTERNALERROR;
-
-    UA_ByteString *newPrivateKey = NULL;
-    if(regenerateKey && *regenerateKey == true)
-        newPrivateKey = UA_ByteString_new();
-
-    for(size_t i = 0; i < server->config.endpointsSize; i++) {
-        UA_SecurityPolicy *sp =
-            getSecurityPolicyByUri(server, &server->config.endpoints[i].securityPolicyUri);
-        if(!sp) {
-            retval = UA_STATUSCODE_BADINTERNALERROR;
-            goto cleanup;
-        }
-
-        if(sp->policyType == UA_SECURITYPOLICYTYPE_NONE)
-            continue;
-
-        if(UA_NodeId_equal(&certificateTypeId, &sp->certificateTypeId) &&
-           UA_NodeId_equal(&certGroupId, &sp->certificateGroupId)) {
-            retval = sp->createSigningRequest(sp, subjectName, nonce,
-                                              &UA_KEYVALUEMAP_NULL, csr, newPrivateKey);
-            if(retval != UA_STATUSCODE_GOOD)
-                goto cleanup;
-        }
-    }
-
-    UA_ByteString_clear(&server->gdsManager.transaction.localCsrCertificate);
-    UA_ByteString_copy(csr, &server->gdsManager.transaction.localCsrCertificate);
-
-cleanup:
-    if(newPrivateKey)
-    {
-        /* wipe private key before freeing its memory */
-        UA_ByteString_memZero(newPrivateKey);
-        UA_ByteString_delete(newPrivateKey);
-    }
-
-    return retval;
-}
-
 /***************************/
 /* Server lookup functions */
 /***************************/
@@ -1191,19 +925,13 @@ setServerLifecycleState(UA_Server *server, UA_LifecycleState state) {
     server->state = state; /* Apply the state change */
 
     /* Call the application notification callback */
-    UA_ServerConfig *config = &server->config;
-    if(config->globalNotificationCallback || config->lifecycleNotificationCallback) {
-        UA_ApplicationNotificationType nt = UA_APPLICATIONNOTIFICATIONTYPE_LIFECYCLE_STARTED;
-        switch(state) {
-        case UA_LIFECYCLESTATE_STOPPED: nt = UA_APPLICATIONNOTIFICATIONTYPE_LIFECYCLE_STOPPING; break;
-        case UA_LIFECYCLESTATE_STOPPING: nt = UA_APPLICATIONNOTIFICATIONTYPE_LIFECYCLE_STOPPING; break;
-        default: break;
-        }
-        if(config->lifecycleNotificationCallback)
-            config->lifecycleNotificationCallback(server, nt, UA_KEYVALUEMAP_NULL);
-        if(config->globalNotificationCallback)
-            config->globalNotificationCallback(server, nt, UA_KEYVALUEMAP_NULL);
+    UA_ApplicationNotificationType nt = UA_APPLICATIONNOTIFICATIONTYPE_LIFECYCLE_STARTED;
+    switch(state) {
+    case UA_LIFECYCLESTATE_STOPPED: nt = UA_APPLICATIONNOTIFICATIONTYPE_LIFECYCLE_STOPPING; break;
+    case UA_LIFECYCLESTATE_STOPPING: nt = UA_APPLICATIONNOTIFICATIONTYPE_LIFECYCLE_STOPPING; break;
+    default: break;
     }
+    notifyApplication(server, nt, UA_KEYVALUEMAP_NULL);
 
     /* Call the (legacy) notification callback */
     if(server->config.notifyLifecycleState)
@@ -1274,6 +1002,12 @@ UA_Server_run_startup(UA_Server *server) {
     /* Take the server lock */
     lockServer(server);
 
+#ifdef UA_ENABLE_SUBSCRIPTIONS_EVENTS
+    /* A restarted server also suppresses changes until startup is complete. */
+    if(server->modelChangeSuppressionDepth == 0)
+        server->modelChangeSuppressionDepth++;
+#endif
+
     /* Does the ApplicationUri match the local certificates? */
     verifyServerApplicationUri(server);
 
@@ -1330,35 +1064,21 @@ UA_Server_run_startup(UA_Server *server) {
         UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER_SERVERSTATUS_STARTTIME);
     writeValueAttribute(server, startTime, &var);
 
-    /* Start all ServerComponents */
-    ZIP_ITER(UA_ServerComponentTree, &server->serverComponents,
-             startServerComponent, server);
-
-    /* Check that the binary protocol support component have been started */
-    UA_ServerComponent *binaryProtocolManager =
-        getServerComponentByName(server, UA_STRING("binary"));
-    if(!binaryProtocolManager) {
-        UA_LOG_ERROR(config->logging, UA_LOGCATEGORY_SERVER,
-                     "Binary protocol support component not found.");
-        /* Stop all server components that have already been started */
-        ZIP_ITER(UA_ServerComponentTree, &server->serverComponents,
-                 stopServerComponent, server);
-        unlockServer(server);
-        return UA_STATUSCODE_BADINTERNALERROR;
-    }
-    if(binaryProtocolManager->state != UA_LIFECYCLESTATE_STARTED) {
-        UA_LOG_ERROR(config->logging, UA_LOGCATEGORY_SERVER,
-                       "The binary protocol support component could not been started.");
-        /* Stop all server components that have already been started */
-        ZIP_ITER(UA_ServerComponentTree, &server->serverComponents,
-                 stopServerComponent, NULL);
-        unlockServer(server);
-        return UA_STATUSCODE_BADINTERNALERROR;
+    /* Start all drivers */
+    for(UA_Driver *drv = server->drivers; drv; drv = drv->next) {
+        drv->start(drv);
     }
 
     /* Set the server to STARTED. From here on, only use
      * UA_Server_run_shutdown(server) to stop the server. */
     setServerLifecycleState(server, UA_LIFECYCLESTATE_STARTED);
+
+#ifdef UA_ENABLE_SUBSCRIPTIONS_EVENTS
+    /* Suppress ModelChangeEvents for the initial address-space construction
+     * and startup callbacks. Enable them only once startup has completed. */
+    UA_assert(server->modelChangeSuppressionDepth > 0);
+    server->modelChangeSuppressionDepth--;
+#endif
 
     unlockServer(server);
     return UA_STATUSCODE_GOOD;
@@ -1394,15 +1114,6 @@ testShutdownCondition(UA_Server *server) {
     return (el->dateTime_now(el) > server->endTime);
 }
 
-static UA_Boolean
-testStoppedCondition(UA_Server *server) {
-    /* Check if there are remaining server components that did not fully stop */
-    if(ZIP_ITER(UA_ServerComponentTree, &server->serverComponents,
-                checkServerComponent, NULL) != NULL)
-        return false;
-    return true;
-}
-
 UA_StatusCode
 UA_Server_run_shutdown(UA_Server *server) {
     if(server == NULL)
@@ -1431,9 +1142,8 @@ UA_Server_run_shutdown(UA_Server *server) {
         server->houseKeepingCallbackId = 0;
     }
 
-    /* Stop all ServerComponents */
-    ZIP_ITER(UA_ServerComponentTree, &server->serverComponents,
-             stopServerComponent, NULL);
+    /* Stop all drivers */
+    stopDrivers(server);
 
     /* Are we already stopped? */
     if(testStoppedCondition(server)) {

@@ -140,7 +140,8 @@ UA_ReaderGroup_create(UA_PubSubManager *psm, UA_NodeId connectionId,
     if(retval != UA_STATUSCODE_GOOD) {
         UA_LOG_ERROR_PUBSUB(psm->logging, newGroup,
                             "Could not validate the connection parameters");
-        UA_ReaderGroup_remove(psm, newGroup);
+        UA_PubSubComponent_freeWithoutLifecycleCallback(
+            psm, newGroup, UA_PUBSUBCOMPONENT_READERGROUP);
         return retval;
     }
 
@@ -152,7 +153,8 @@ UA_ReaderGroup_create(UA_PubSubManager *psm, UA_NodeId connectionId,
         if(retval != UA_STATUSCODE_GOOD) {
             UA_LOG_ERROR_PUBSUB(psm->logging, newGroup,
                                 "Attaching the SKS KeyStorage failed");
-            UA_ReaderGroup_remove(psm, newGroup);
+            UA_PubSubComponent_freeWithoutLifecycleCallback(
+                psm, newGroup, UA_PUBSUBCOMPONENT_READERGROUP);
             return retval;
         }
     }
@@ -160,9 +162,10 @@ UA_ReaderGroup_create(UA_PubSubManager *psm, UA_NodeId connectionId,
 
     /* Create information model representation */
 #ifdef UA_ENABLE_PUBSUB_INFORMATIONMODEL
-    retval |= addReaderGroupRepresentation(psm->sc.server, newGroup);
+    retval |= addReaderGroupRepresentation(psm->drv.server, newGroup);
     if(retval != UA_STATUSCODE_GOOD) {
-        UA_ReaderGroup_remove(psm, newGroup);
+        UA_PubSubComponent_freeWithoutLifecycleCallback(
+            psm, newGroup, UA_PUBSUBCOMPONENT_READERGROUP);
         return retval;
     }
 #else
@@ -171,13 +174,16 @@ UA_ReaderGroup_create(UA_PubSubManager *psm, UA_NodeId connectionId,
 
     /* Notify the application that a new ReaderGroup was created.
      * This may internally adjust the config */
-    UA_Server *server = psm->sc.server;
+    UA_Server *server = psm->drv.server;
     if(server->config.pubSubConfig.componentLifecycleCallback) {
         retval = server->config.pubSubConfig.
             componentLifecycleCallback(server, newGroup->head.identifier,
                                        UA_PUBSUBCOMPONENT_READERGROUP, false);
         if(retval != UA_STATUSCODE_GOOD) {
-            UA_ReaderGroup_remove(psm, newGroup);
+            /* The app refused the component; free without re-asking the
+             * lifecycle callback (it would re-reject and leak the group). */
+            UA_PubSubComponent_freeWithoutLifecycleCallback(
+                psm, newGroup, UA_PUBSUBCOMPONENT_READERGROUP);
             return retval;
         }
     }
@@ -203,13 +209,13 @@ UA_ReaderGroup_create(UA_PubSubManager *psm, UA_NodeId connectionId,
 
 UA_StatusCode
 UA_ReaderGroup_remove(UA_PubSubManager *psm, UA_ReaderGroup *rg) {
-    UA_LOCK_ASSERT(&psm->sc.server->serviceMutex);
+    UA_LOCK_ASSERT(&psm->drv.server->serviceMutex);
 
     UA_PubSubConnection *connection = rg->linkedConnection;
     UA_assert(connection);
 
     /* Check with the application if we can remove */
-    UA_Server *server = psm->sc.server;
+    UA_Server *server = psm->drv.server;
     if(server->config.pubSubConfig.componentLifecycleCallback) {
         UA_StatusCode res = server->config.pubSubConfig.
             componentLifecycleCallback(server, rg->head.identifier,
@@ -250,7 +256,7 @@ UA_ReaderGroup_remove(UA_PubSubManager *psm, UA_ReaderGroup *rg) {
 
         /* Actually remove the ReaderGroup */
 #ifdef UA_ENABLE_PUBSUB_INFORMATIONMODEL
-        deleteNode(psm->sc.server, rg->head.identifier, true);
+        deleteNode(psm->drv.server, rg->head.identifier, true);
 #endif
 
         UA_LOG_INFO_PUBSUB(psm->logging, rg, "ReaderGroup deleted");
@@ -269,7 +275,7 @@ UA_ReaderGroup_remove(UA_PubSubManager *psm, UA_ReaderGroup *rg) {
 UA_StatusCode
 UA_ReaderGroup_setPubSubState(UA_PubSubManager *psm, UA_ReaderGroup *rg,
                               UA_PubSubState targetState) {
-    UA_LOCK_ASSERT(&psm->sc.server->serviceMutex);
+    UA_LOCK_ASSERT(&psm->drv.server->serviceMutex);
 
     if(rg->deleteFlag && targetState != UA_PUBSUBSTATE_DISABLED) {
         UA_LOG_WARNING_PUBSUB(psm->logging, rg,
@@ -279,7 +285,7 @@ UA_ReaderGroup_setPubSubState(UA_PubSubManager *psm, UA_ReaderGroup *rg,
 
     /* Callback to modify the WriterGroup config and change the targetState
      * before the state machine executes */
-    UA_Server *server = psm->sc.server;
+    UA_Server *server = psm->drv.server;
     if(server->config.pubSubConfig.beforeStateChangeCallback) {
         server->config.pubSubConfig.
             beforeStateChangeCallback(server, rg->head.identifier, &targetState);
@@ -314,7 +320,7 @@ UA_ReaderGroup_setPubSubState(UA_PubSubManager *psm, UA_ReaderGroup *rg,
     case UA_PUBSUBSTATE_PAUSED:
     case UA_PUBSUBSTATE_PREOPERATIONAL:
     case UA_PUBSUBSTATE_OPERATIONAL:
-        if(psm->sc.state != UA_LIFECYCLESTATE_STARTED) {
+        if(psm->drv.state != UA_LIFECYCLESTATE_STARTED) {
             /* Avoid repeat warnings */
             if(oldState != UA_PUBSUBSTATE_PAUSED) {
                 UA_LOG_WARNING_PUBSUB(psm->logging, rg,
@@ -389,7 +395,7 @@ UA_ReaderGroup_setPubSubState(UA_PubSubManager *psm, UA_ReaderGroup *rg,
 
     /* Update the PubSubManager state. It will go from STOPPING to STOPPED when
      * the last socket has closed. */
-    UA_PubSubManager_setState(psm, psm->sc.state);
+    UA_PubSubManager_setState(psm, psm->drv.state);
 
     return ret;
 }
@@ -494,7 +500,7 @@ UA_ReaderGroup_decodeNetworkMessage(UA_PubSubManager *psm,
     memset(&ctx, 0, sizeof(PubSubDecodeCtx));
     ctx.ctx.pos = buffer.data;
     ctx.ctx.end = buffer.data + buffer.length;
-    ctx.ctx.opts.customTypes = psm->sc.server->config.customDataTypes;
+    ctx.ctx.opts.customTypes = psm->drv.server->config.customDataTypes;
 
     /* Decode the headers. This sets the number of DataSetMessages and retrieves
      * the DataSetWriterIds. Those get matched to the readers below. */
@@ -533,8 +539,13 @@ UA_ReaderGroup_decodeNetworkMessage(UA_PubSubManager *psm,
     }
 
     /* Handle missing payload header and "inject" metadata */
-    if(!nm->payloadHeaderEnabled)
-        UA_NetworkMessage_makeSyntheticPayloadHeader(&ctx.eo, nm);
+    if(!nm->payloadHeaderEnabled) {
+        rv = UA_NetworkMessage_makeSyntheticPayloadHeader(&ctx.eo, nm);
+        if(rv != UA_STATUSCODE_GOOD) {
+            UA_NetworkMessage_clear(nm);
+            return rv;
+        }
+    }
 
     /* Decrypt */
     rv = verifyAndDecryptNetworkMessage(psm->logging, buffer, &ctx.ctx, nm, rg);
@@ -568,7 +579,7 @@ UA_ReaderGroup_decodeNetworkMessageJSON(UA_PubSubManager *psm,
     /* Set up the decoding options */
     UA_DecodeJsonOptions jo;
     memset(&jo, 0, sizeof(jo));
-    jo.customTypes = psm->sc.server->config.customDataTypes;
+    jo.customTypes = psm->drv.server->config.customDataTypes;
 
     /* Prepare the metadata with information from the readers to decode the
      * DataSetMessages */
@@ -688,6 +699,11 @@ verifyAndDecryptNetworkMessage(const UA_Logger *logger, UA_ByteString buffer,
     /* Validate the signature */
     if(doValidate) {
         size_t sigSize = sp->getSignatureSize(sp, cc);
+        if(buffer.length < sigSize) {
+            UA_LOG_WARNING(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                           "PubSub receive. Message too short for signature");
+            return UA_STATUSCODE_BADSECURITYCHECKSFAILED;
+        }
         UA_ByteString toBeVerified = {buffer.length - sigSize, buffer.data};
         UA_ByteString signature = {sigSize, buffer.data + buffer.length - sigSize};
 
@@ -791,7 +807,7 @@ ReaderGroupChannelCallback(UA_ConnectionManager *cm, uintptr_t connectionId,
     /* Get the context pointers */
     UA_ReaderGroup *rg = (UA_ReaderGroup*)*connectionContext;
     UA_PubSubManager *psm = (UA_PubSubManager*)application;
-    UA_Server *server = psm->sc.server;
+    UA_Server *server = psm->drv.server;
 
     lockServer(server);
 
@@ -813,7 +829,7 @@ ReaderGroupChannelCallback(UA_ConnectionManager *cm, uintptr_t connectionId,
 
         /* Switch the psm state from stopping to stopped once the last
          * connection has closed */
-        UA_PubSubManager_setState(psm, psm->sc.state);
+        UA_PubSubManager_setState(psm, psm->drv.state);
 
         unlockServer(server);
         return;
@@ -840,9 +856,10 @@ ReaderGroupChannelCallback(UA_ConnectionManager *cm, uintptr_t connectionId,
         return;
     }
 
-    if(rg->head.state != UA_PUBSUBSTATE_OPERATIONAL) {
+    if (rg->head.state != UA_PUBSUBSTATE_OPERATIONAL &&
+        rg->head.state != UA_PUBSUBSTATE_PREOPERATIONAL) {
         UA_LOG_WARNING_PUBSUB(psm->logging, rg,
-                              "Received a messaage for a non-operational ReaderGroup");
+            "Received a message for a disabled ReaderGroup");
         unlockServer(server);
         return;
     }
@@ -875,7 +892,7 @@ ReaderGroupChannelCallback(UA_ConnectionManager *cm, uintptr_t connectionId,
 static UA_StatusCode
 UA_ReaderGroup_connectMQTT(UA_PubSubManager *psm, UA_ReaderGroup *rg,
                            UA_Boolean validate) {
-    UA_LOCK_ASSERT(&psm->sc.server->serviceMutex);
+    UA_LOCK_ASSERT(&psm->drv.server->serviceMutex);
 
     UA_PubSubConnection *c = rg->linkedConnection;
     UA_NetworkAddressUrlDataType *addressUrl = (UA_NetworkAddressUrlDataType*)
@@ -946,7 +963,7 @@ UA_ReaderGroup_canConnect(UA_ReaderGroup *rg) {
 
 UA_StatusCode
 UA_ReaderGroup_connect(UA_PubSubManager *psm, UA_ReaderGroup *rg, UA_Boolean validate) {
-    UA_Server *server = psm->sc.server;
+    UA_Server *server = psm->drv.server;
     UA_LOCK_ASSERT(&server->serviceMutex);
 
     /* Is this a ReaderGroup with custom TransportSettings beyond the
@@ -954,7 +971,7 @@ UA_ReaderGroup_connect(UA_PubSubManager *psm, UA_ReaderGroup *rg, UA_Boolean val
     if(rg->config.transportSettings.encoding == UA_EXTENSIONOBJECT_ENCODED_NOBODY)
         return UA_STATUSCODE_GOOD;
 
-    UA_EventLoop *el = psm->sc.server->config.eventLoop;
+    UA_EventLoop *el = psm->drv.server->config.eventLoop;
     if(!el) {
         UA_LOG_ERROR_PUBSUB(server->config.logging, rg, "No EventLoop configured");
         return UA_STATUSCODE_BADINTERNALERROR;

@@ -12,6 +12,10 @@
 #include "ua_server_internal.h"
 #include "ua_subscription.h"
 
+#ifdef UA_ENABLE_RBAC
+#include "ua_server_rbac.h"
+#endif
+
 #ifdef UA_ENABLE_SUBSCRIPTIONS_EVENTS
 
 static UA_StatusCode
@@ -35,18 +39,6 @@ readSAOfromEventInstance(UA_FilterEvalContext *ctx,
         /* If this list (browsePath) is empty, the Node is the instance of the
          * TypeDefinition. (Part 4, 7.4.4.5) */
         rvi.nodeId = *ei;
-
-        /* A Condition is an indirection. Look up the target node. */
-        /* TODO: check for Branches! One Condition could have multiple Branches */
-        UA_NodeId conditionTypeId = UA_NODEID_NUMERIC(0, UA_NS0ID_CONDITIONTYPE);
-        if(UA_NodeId_equal(&sao->typeDefinitionId, &conditionTypeId)) {
-#ifdef UA_ENABLE_SUBSCRIPTIONS_ALARMS_CONDITIONS
-            UA_StatusCode res = UA_getConditionId(ctx->server, ctx->ed.eventInstance, &rvi.nodeId);
-            UA_CHECK_STATUS(res, return res);
-#else
-            return UA_STATUSCODE_BADNOTSUPPORTED;
-#endif
-        }
 
         v = readWithSession(ctx->server, ctx->session, &rvi, UA_TIMESTAMPSTORETURN_NEITHER);
     } else {
@@ -486,22 +478,28 @@ implicitCastTargetType(const UA_DataType *t1, const UA_DataType *t2) {
  * - Converting a value that is outside the range of the target type causes a
  *   conversion error. */
 
-#define UA_CAST_SIGNED(t, T)                                         \
-    if(i < (UA_Int64)T##_MIN || i > (UA_Int64)T##_MAX)               \
-        return;                                                      \
-    *(t*)data = (t)i;                                                \
+#define UA_CAST_SIGNED(t, T)                                           \
+    if(i < (UA_Int64)T##_MIN || i > (UA_Int64)T##_MAX) {               \
+        UA_free(data);                                                 \
+        return;                                                        \
+    }                                                                  \
+    *(t*)data = (t)i;                                                  \
     do { } while(0)
 
-#define UA_CAST_UNSIGNED(t, T)                                       \
-    if(u > T##_MAX)                                                  \
-        return;                                                      \
-    *(t*)data = (t)u;                                                \
+#define UA_CAST_UNSIGNED(t, T)                                         \
+    if(u > T##_MAX) {                                                  \
+        UA_free(data);                                                 \
+        return;                                                        \
+    }                                                                  \
+    *(t*)data = (t)u;                                                  \
     do { } while(0)
 
-#define UA_CAST_FLOAT(t, T)                                          \
-    if(f + 0.5 < (UA_Double)T##_MIN || f + 0.5 > (UA_Double)T##_MAX) \
-        return;                                                      \
-    *(t*)data = (t)(f + 0.5);                                        \
+#define UA_CAST_FLOAT(t, T)                                            \
+    if(f + 0.5 < (UA_Double)T##_MIN || f + 0.5 > (UA_Double)T##_MAX) { \
+        UA_free(data);                                                 \
+        return;                                                        \
+    }                                                                  \
+    *(t*)data = (t)(f + 0.5);                                          \
     do { } while(0)
 
 /* We can cast between any numerical type. So this can be reused for explicit casting. */
@@ -1551,17 +1549,6 @@ createEvent(UA_Server *server, const UA_EventDescription *ed,
                  "Events: An event of severity %u is emitted by node %N",
                  ed->severity, ed->sourceNode);
 
-#ifdef UA_ENABLE_SUBSCRIPTIONS_ALARMS_CONDITIONS
-    UA_Boolean isCallerAC = false;
-    if(isConditionOrBranch(server, &ed->eventType, &ed->sourceNode, &isCallerAC) &&
-       !isCallerAC) {
-        UA_LOG_WARNING(server->config.logging, UA_LOGCATEGORY_SERVER,
-                       "Condition Events: Please use A&C API to trigger Condition Events 0x%08X",
-                       UA_STATUSCODE_BADINVALIDARGUMENT);
-        return UA_STATUSCODE_BADINVALIDARGUMENT;
-    }
-#endif /* UA_ENABLE_SUBSCRIPTIONS_ALARMS_CONDITIONS */
-
     /* The user must ensure that only nodes from the Objects folder (and Views)
      * emit events. The following commented code could enforce this, but is
      * computationally expensive. */
@@ -1666,7 +1653,7 @@ createEvent(UA_Server *server, const UA_EventDescription *ed,
 
         /* Iterate over all MonitoredItems registered in the node  */
         for(UA_MonitoredItem *mon = node->head.monitoredItems;
-            mon != NULL; mon = mon->sampling.nodeListNext) {
+            mon != NULL; mon = mon->nodeListNext) {
             /* Is this an Event-MonitoredItem? */
             if(mon->itemToMonitor.attributeId != UA_ATTRIBUTEID_EVENTNOTIFIER)
                 continue;
@@ -1695,10 +1682,37 @@ createEvent(UA_Server *server, const UA_EventDescription *ed,
             }
             ctx.filter = *(UA_EventFilter*)mon->parameters.filter.content.decoded.data;
 
-            /* Select the session used to resolve SimpleAttributeOperands. If
-             * the subscription is not bound to a session, use the AdminSession.
-             * TODO: Preserve the access rights of the last connected session? */
-            ctx.session = (sub->session) ? sub->session : &server->adminSession;
+            /* Do not evaluate event fields for detached subscriptions.
+             * Using adminSession would bypass per-session access control. */
+            if(!sub->session)
+                continue;
+            ctx.session = sub->session;
+
+#ifdef UA_ENABLE_RBAC
+            /* OPC UA Part 3 v1.05 §8.55, bit 11 (ReceiveEvents):
+             * "A Client only receives an Event if this bit is set on the
+             *  Node identified by the EventTypeId field and on the Node
+             *  identified by the SourceNode field."
+             *
+             * Skip MonitoredItems if the session lacks RECEIVEEVENTS on
+             * either EventType or SourceNode. AdminSession is exempt.
+             * UA_PERMISSIONTYPE_ALL means no RBAC entries for that node
+             * and is treated as permissive for compatibility. */
+            if(ctx.session != &server->adminSession) {
+                UA_PermissionType evtPerms = UA_PERMISSIONTYPE_ALL;
+                UA_PermissionType srcPerms = UA_PERMISSIONTYPE_ALL;
+                (void)getEffectivePermissions(server, ctx.session,
+                                              &ed->eventType, &evtPerms);
+                (void)getEffectivePermissions(server, ctx.session,
+                                              &ed->sourceNode, &srcPerms);
+                if((evtPerms != UA_PERMISSIONTYPE_ALL &&
+                    !(evtPerms & UA_PERMISSIONTYPE_RECEIVEEVENTS)) ||
+                   (srcPerms != UA_PERMISSIONTYPE_ALL &&
+                    !(srcPerms & UA_PERMISSIONTYPE_RECEIVEEVENTS))) {
+                    continue;
+                }
+            }
+#endif
 
             /* Evaluate the where-clause and create a notification */
             res = UA_MonitoredItem_addEvent(mon, &ctx);

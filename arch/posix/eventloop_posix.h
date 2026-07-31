@@ -270,16 +270,10 @@ typedef int SOCKET;
 #include <libgen.h>
 #include <limits.h>
 #include <stdio.h>
-#ifndef __APPLE__
+#ifdef __linux__
 # include <sys/inotify.h>
-#endif /* !__APPLE__ */
+#endif /* __linux__ */
 #include <sys/stat.h>
-
-#ifndef __ANDROID__
-#ifndef __APPLE__
-#include <bits/stdio_lim.h>
-#endif /* !__APPLE__ */
-#endif /* !__ANDROID__ */
 
 #define UA_STAT stat
 #define UA_DIR DIR
@@ -409,9 +403,9 @@ typedef struct {
      * finished before.
      *
      * The currently unused head gets marked with the 0x01 sentinel. */
-    UA_DelayedCallback *delayedHead1;
-    UA_DelayedCallback *delayedHead2;
-    UA_DelayedCallback **delayedTail;
+    UA_atomic(UA_DelayedCallback *) delayedHead1;
+    UA_atomic(UA_DelayedCallback *) delayedHead2;
+    UA_atomic(UA_atomic(UA_DelayedCallback *)*) delayedTail;
 
     /* Flag determining whether the eventloop is currently within the
      * "run" method */
@@ -434,6 +428,13 @@ typedef struct {
 
     /* Self-pipe to cancel blocking wait */
     UA_FD selfpipe[2]; /* 0: read, 1: write */
+
+#ifdef UA_ENABLE_LWS
+    /* One libwebsockets context shared by all users of this EventLoop */
+    void *lwsContext;
+    size_t lwsContextUsers;
+    UA_EventLoop *lwsForeignLoop;
+#endif
 
 #if UA_MULTITHREADING >= 100
     UA_Lock elMutex;
@@ -487,18 +488,17 @@ UA_StatusCode
 UA_EventLoopPOSIX_setReusable(UA_FD sockfd);
 
 /* Windows has no pipes. Use a local TCP connection for the self-pipe trick.
- * https://stackoverflow.com/a/3333565 */
-#if defined(UA_ARCHITECTURE_WIN32) || defined(__APPLE__)
+ * https://stackoverflow.com/a/3333565
+ * On POSIX, use a socketpair (AF_UNIX) for uniform socket semantics. */
+#ifdef UA_ARCHITECTURE_WIN32
 int UA_EventLoopPOSIX_pipe(SOCKET fds[2]);
-#elif defined(__QNX__)
-int UA_EventLoopPOSIX_pipe(int fds[2]);
 #else
-# define UA_EventLoopPOSIX_pipe(fds) pipe2(fds, O_NONBLOCK)
+int UA_EventLoopPOSIX_pipe(UA_FD fds[2]);
 #endif
 
 /* Cancel the current _run by sending to the self-pipe */
 void
-UA_EventLoopPOSIX_cancel(UA_EventLoopPOSIX *el);
+UA_EventLoopPOSIX_cancel(UA_EventLoop *el);
 
 void
 UA_EventLoopPOSIX_addDelayedCallback(UA_EventLoop *public_el,

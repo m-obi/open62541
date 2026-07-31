@@ -99,6 +99,26 @@ UA_Client_delete(UA_Client *client);
 UA_StatusCode UA_EXPORT UA_THREADSAFE
 UA_Client_run_iterate(UA_Client *client, UA_UInt32 timeout);
 
+/* Runs the client until interrupted. On Unix/Windows this registers an
+ * interrupt for SIGINT (ctrl-c). The method only returns after having received
+ * the interrupt or upon an error condition. The logical sequence is as follows:
+ *
+ * - Register the interrupt
+ * - Loop until interrupt: UA_Client_run_iterate
+ * - Deregister the interrupt
+ *
+ * The inner loop is also aborted when the client is disconnected and fails the
+ * automatic reconnect.
+ *
+ * Attention! This method does not call UA_Client_connect() / _disconnect()
+ * internally. This needs to be handled before and after.
+ *
+ * Attention! This method is implemented individually for the different
+ * platforms (POSIX/Win32/etc.). The default implementation is in
+ * /plugins/ua_config_default.c under the CC0 license. Adjust as needed. */
+UA_EXPORT UA_StatusCode
+UA_Client_runUntilInterrupt(UA_Client *client);
+
 /**
  * Connect to a Server
  * -------------------
@@ -769,6 +789,17 @@ struct UA_ClientConfig {
     /* Advanced Settings
      * ~~~~~~~~~~~~~~~~~ */
 
+    /* Maximum number of application-level asynchronous service calls that may
+     * be outstanding. A value of 0 disables the limit. The default is 32.
+     * Internal requests for connection maintenance and Publish are not counted.
+     *
+     * When the limit is reached, UA_RULEHANDLING_ABORT (and DEFAULT) rejects a
+     * new call with BadTooManyOperations. UA_RULEHANDLING_WARN logs a warning
+     * and waits for capacity. UA_RULEHANDLING_ACCEPT waits silently. Waiting
+     * runs the EventLoop and can therefore execute user callbacks. */
+    UA_UInt32 maxAsyncServiceCalls;
+    UA_RuleHandling asyncServiceCallRule;
+
     /* Number of PublishResponse queued up in the server */
     UA_UInt16 outStandingPublishRequests;
 
@@ -819,6 +850,43 @@ UA_ClientConfig_setAuthenticationCert(UA_ClientConfig *config,
                                       UA_ByteString certificateAuth,
                                       UA_ByteString privateKeyAuth);
 #endif
+
+/**
+ * .. _client-json-config:
+ *
+ * Configuration from File
+ * -----------------------
+ *
+ * The client can be configured from JSON5-formatted content stored in a
+ * ``UA_ByteString``.
+ *
+ * The example files ``examples/json_config/client_json_config.json5`` and
+ * ``examples/client_json_config.c`` document the intended workflow and the
+ * currently supported keys.
+ *
+ * The following functions require JSON encoding support
+ * (``UA_ENABLE_JSON_ENCODING``). */
+
+#ifdef UA_ENABLE_JSON_ENCODING
+
+/* Create a new client from a file.  The client configuration is loaded from a
+ * Json5 file.
+ *
+ * @param jsonConfig The configuration in json5 format.
+ */
+UA_EXPORT UA_Client *
+UA_Client_newFromFile(const UA_ByteString jsonConfig);
+
+/* Loads a client configuration from a file.  The passed client configuration is
+ * cleared.  Memory will be allocated for fields in config.
+ *
+ * @param config The client configuration.
+ * @param jsonConfig The configuration in json5 format.
+ */
+UA_EXPORT UA_StatusCode
+UA_ClientConfig_loadFromFile(UA_ClientConfig *config, const UA_ByteString jsonConfig);
+
+#endif /* UA_ENABLE_JSON_ENCODING */
 
 _UA_END_DECLS
 

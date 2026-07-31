@@ -81,8 +81,9 @@ setAbsoluteFromPercentageDeadband(UA_Server *server, UA_Session *session,
 
 UA_Boolean
 Service_SetTriggering(UA_Server *server, UA_Session *session,
-                      const UA_SetTriggeringRequest *request,
-                      UA_SetTriggeringResponse *response) {
+                      const void *request_, void *response_) {
+    const UA_SetTriggeringRequest *request = (const UA_SetTriggeringRequest*)request_;
+    UA_SetTriggeringResponse *response = (UA_SetTriggeringResponse*)response_;
     /* Nothing to do? */
     if(request->linksToRemoveSize == 0 &&
        request->linksToAddSize == 0) {
@@ -214,6 +215,18 @@ checkEventFilterParam(UA_Server *server, UA_Session *session,
 }
 #endif
 
+UA_Boolean
+VariableNode_externalDataSource(const UA_VariableNode *vn) {
+    switch(vn->valueSourceType) {
+    case UA_VALUESOURCETYPE_INTERNAL:
+        return (vn->valueSource.internal.notifications.onRead != NULL);
+    case UA_VALUESOURCETYPE_EXTERNAL:
+    case UA_VALUESOURCETYPE_CALLBACK:
+    default:
+        return true;
+    }
+}
+
 /* Verify and adjust the parameters of a MonitoredItem */
 static UA_StatusCode
 checkAdjustMonitoredItemParams(UA_Server *server, UA_Session *session,
@@ -280,26 +293,6 @@ checkAdjustMonitoredItemParams(UA_Server *server, UA_Session *session,
         }
     }
 
-    /* Read the minimum sampling interval for the variable. The sampling
-     * interval of the MonitoredItem must not be less than that. */
-    if(mon->itemToMonitor.attributeId == UA_ATTRIBUTEID_VALUE) {
-        const UA_Node *node = UA_NODESTORE_GET(server, &mon->itemToMonitor.nodeId);
-        if(node) {
-            const UA_VariableNode *vn = &node->variableNode;
-            if(node->head.nodeClass == UA_NODECLASS_VARIABLE) {
-                /* Take into account if the publishing interval is used for sampling */
-                UA_Double samplingInterval = params->samplingInterval;
-                if(samplingInterval < 0 && mon->subscription)
-                    samplingInterval = mon->subscription->publishingInterval;
-                /* Adjust if smaller than the allowed minimum for the variable */
-                if(samplingInterval < vn->minimumSamplingInterval)
-                    params->samplingInterval = vn->minimumSamplingInterval;
-            }
-            UA_NODESTORE_RELEASE(server, node);
-        }
-    }
-
-
     /* A negative number indicates that the sampling interval is the publishing
      * interval of the Subscription. Note that the sampling interval selected
      * here remains also when the Subscription's publish interval is adjusted
@@ -307,13 +300,37 @@ checkAdjustMonitoredItemParams(UA_Server *server, UA_Session *session,
     if(mon->subscription && params->samplingInterval < 0.0)
         params->samplingInterval = mon->subscription->publishingInterval;
 
-    /* Adjust non-null sampling interval to lie within the configured limits */
-    if(params->samplingInterval != 0.0) {
+    /* If the value comes from an "external" data source, sampling is required.
+     * Otherwise, for samplingInterval == 0, we add a hook for every write. */
+    UA_Boolean extValueSource = false;
+
+    /* VariableNodes can lower-bound the permissible sampling interval */
+    UA_Double minimumSamplingInterval = 0.0;
+
+    /* Use hasValueSource and minimumSamplingInterval from a VariableNode */
+    if(mon->itemToMonitor.attributeId == UA_ATTRIBUTEID_VALUE) {
+        const UA_Node *node = UA_NODESTORE_GET(server, &mon->itemToMonitor.nodeId);
+        if(node) {
+            if(node->head.nodeClass == UA_NODECLASS_VARIABLE) {
+                minimumSamplingInterval = node->variableNode.minimumSamplingInterval;
+                extValueSource = VariableNode_externalDataSource(&node->variableNode);
+            }
+            UA_NODESTORE_RELEASE(server, node);
+        }
+    }
+
+    /* Adjust non-null sampling interval to lie within the configured limits.
+     * Nodes with a value source require a >0.0 sampling interval. */
+    if(params->samplingInterval != 0.0 || extValueSource) {
         UA_BOUNDEDVALUE_SETWBOUNDS(server->config.samplingIntervalLimits,
                                    params->samplingInterval, params->samplingInterval);
         /* Check for NaN */
         if(mon->parameters.samplingInterval != mon->parameters.samplingInterval)
             params->samplingInterval = server->config.samplingIntervalLimits.min;
+
+        /* Minimum interval from the node */
+        if(params->samplingInterval < minimumSamplingInterval)
+            params->samplingInterval = minimumSamplingInterval;
     }
 
     /* Adjust the maximum queue size */
@@ -350,16 +367,11 @@ struct createMonContext {
     UA_LocalMonitoredItem *localMon; /* used if non-null */
 };
 
-static void
+void
 notifyMonitoredItem(UA_Server *server, UA_MonitoredItem *mon,
                     UA_ApplicationNotificationType type) {
-    /* Nothing to do? */
-    if(!server->config.globalNotificationCallback &&
-       !server->config.subscriptionNotificationCallback)
-        return;
-
     /* Set up the key-value map */
-    static UA_THREAD_LOCAL UA_KeyValuePair notifyMonData[13] = {
+    UA_STATIC_THREAD_LOCAL UA_KeyValuePair notifyMonData[13] = {
         {{0, UA_STRING_STATIC("session-id")}, {0}},
         {{0, UA_STRING_STATIC("subscription-id")}, {0}},
         {{0, UA_STRING_STATIC("monitoreditem-id")}, {0}},
@@ -412,17 +424,18 @@ notifyMonitoredItem(UA_Server *server, UA_MonitoredItem *mon,
                          &UA_TYPES[UA_TYPES_BOOLEAN]);
 
     /* Notify the application */
-    if(server->config.subscriptionNotificationCallback)
-        server->config.subscriptionNotificationCallback(server, type, notifyMonMap);
-    if(server->config.globalNotificationCallback)
-        server->config.globalNotificationCallback(server, type, notifyMonMap);
+    notifyApplication(server, type, notifyMonMap);
 }
 
 static void
 Operation_CreateMonitoredItem(UA_Server *server, UA_Session *session,
-                              struct createMonContext *cmc,
-                              const UA_MonitoredItemCreateRequest *request,
-                              UA_MonitoredItemCreateResult *result) {
+                              const void *context /* struct createMonContext */,
+                              const void *request_ /* UA_MonitoredItemCreateRequest */,
+                              void *response /* UA_MonitoredItemCreateResult */) {
+    struct createMonContext *cmc = (struct createMonContext*)(uintptr_t)context;
+    const UA_MonitoredItemCreateRequest *request =
+        (const UA_MonitoredItemCreateRequest*)request_;
+    UA_MonitoredItemCreateResult *result = (UA_MonitoredItemCreateResult*)response;
     UA_LOCK_ASSERT(&server->serviceMutex);
 
     /* Check available capacity */
@@ -510,9 +523,11 @@ Operation_CreateMonitoredItem(UA_Server *server, UA_Session *session,
     /* Allocate the MonitoredItem */
     UA_MonitoredItem *newMon = NULL;
     if(cmc->localMon) {
+        /* Local MonitoredItem / Server C API. Use the pre-allocated memory. */
         newMon = &cmc->localMon->monitoredItem;
         cmc->localMon = NULL; /* clean up internally from now on */
     } else {
+        /* Allocate memory for the remote MonitoredItem */
         newMon = (UA_MonitoredItem*)UA_malloc(sizeof(UA_MonitoredItem));
         if(!newMon) {
             result->statusCode = UA_STATUSCODE_BADOUTOFMEMORY;
@@ -537,7 +552,7 @@ Operation_CreateMonitoredItem(UA_Server *server, UA_Session *session,
                                  "Could not create a MonitoredItem "
                                  "with StatusCode %s",
                                  UA_StatusCode_name(result->statusCode));
-        UA_MonitoredItem_delete(server, newMon);
+        UA_MonitoredItem_delete(server, newMon, false);
         return;
     }
 
@@ -565,10 +580,7 @@ Operation_CreateMonitoredItem(UA_Server *server, UA_Session *session,
     result->statusCode = UA_MonitoredItem_setMonitoringMode(server, newMon,
                                                             request->monitoringMode);
     if(result->statusCode != UA_STATUSCODE_GOOD) {
-        /* Notify again if the MonitoringMode could not be set */
-        notifyMonitoredItem(server, newMon,
-                            UA_APPLICATIONNOTIFICATIONTYPE_MONITOREDITEM_DELETE);
-        UA_MonitoredItem_delete(server, newMon);
+        UA_MonitoredItem_delete(server, newMon, true);
         return;
     }
 
@@ -580,8 +592,9 @@ Operation_CreateMonitoredItem(UA_Server *server, UA_Session *session,
 
 UA_Boolean
 Service_CreateMonitoredItems(UA_Server *server, UA_Session *session,
-                             const UA_CreateMonitoredItemsRequest *request,
-                             UA_CreateMonitoredItemsResponse *response) {
+                             const void *request_, void *response_) {
+    const UA_CreateMonitoredItemsRequest *request = (const UA_CreateMonitoredItemsRequest*)request_;
+    UA_CreateMonitoredItemsResponse *response = (UA_CreateMonitoredItemsResponse*)response_;
     UA_LOG_DEBUG_SESSION(server->config.logging, session,
                          "Processing CreateMonitoredItemsRequest");
     UA_LOCK_ASSERT(&server->serviceMutex);
@@ -618,7 +631,7 @@ Service_CreateMonitoredItems(UA_Server *server, UA_Session *session,
 
     response->responseHeader.serviceResult =
         allocProcessServiceOperations(server, session,
-                                      (UA_ServiceOperation)Operation_CreateMonitoredItem,
+                                      Operation_CreateMonitoredItem,
                                       &cmc, &request->itemsToCreateSize,
                                       &UA_TYPES[UA_TYPES_MONITOREDITEMCREATEREQUEST],
                                       &response->resultsSize,
@@ -773,9 +786,14 @@ UA_Server_createEventMonitoredItem(UA_Server *server, const UA_NodeId nodeId,
 #endif
 
 static void
-Operation_ModifyMonitoredItem(UA_Server *server, UA_Session *session, UA_Subscription *sub,
-                              const UA_MonitoredItemModifyRequest *request,
-                              UA_MonitoredItemModifyResult *result) {
+Operation_ModifyMonitoredItem(UA_Server *server, UA_Session *session,
+                              const void *context /* UA_Subscription */,
+                              const void *request_ /* UA_MonitoredItemModifyRequest */,
+                              void *response /* UA_MonitoredItemModifyResult */) {
+    UA_Subscription *sub = (UA_Subscription*)(uintptr_t)context;
+    const UA_MonitoredItemModifyRequest *request =
+        (const UA_MonitoredItemModifyRequest*)request_;
+    UA_MonitoredItemModifyResult *result = (UA_MonitoredItemModifyResult*)response;
     /* Get the MonitoredItem */
     UA_MonitoredItem *mon = UA_Subscription_getMonitoredItem(sub, request->monitoredItemId);
     if(!mon) {
@@ -858,8 +876,9 @@ Operation_ModifyMonitoredItem(UA_Server *server, UA_Session *session, UA_Subscri
 
 UA_Boolean
 Service_ModifyMonitoredItems(UA_Server *server, UA_Session *session,
-                             const UA_ModifyMonitoredItemsRequest *request,
-                             UA_ModifyMonitoredItemsResponse *response) {
+                             const void *request_, void *response_) {
+    const UA_ModifyMonitoredItemsRequest *request = (const UA_ModifyMonitoredItemsRequest*)request_;
+    UA_ModifyMonitoredItemsResponse *response = (UA_ModifyMonitoredItemsResponse*)response_;
     UA_LOG_DEBUG_SESSION(server->config.logging, session,
                          "Processing ModifyMonitoredItemsRequest");
     UA_LOCK_ASSERT(&server->serviceMutex);
@@ -888,7 +907,7 @@ Service_ModifyMonitoredItems(UA_Server *server, UA_Session *session,
 
     response->responseHeader.serviceResult =
         allocProcessServiceOperations(server, session,
-                                      (UA_ServiceOperation)Operation_ModifyMonitoredItem,
+                                      Operation_ModifyMonitoredItem,
                                       sub, &request->itemsToModifySize,
                                       &UA_TYPES[UA_TYPES_MONITOREDITEMMODIFYREQUEST],
                                       &response->resultsSize,
@@ -904,8 +923,12 @@ struct setMonitoringContext {
 
 static void
 Operation_SetMonitoringMode(UA_Server *server, UA_Session *session,
-                            struct setMonitoringContext *smc,
-                            const UA_UInt32 *monitoredItemId, UA_StatusCode *result) {
+                            const void *context /* struct setMonitoringContext */,
+                            const void *request /* UA_UInt32 */,
+                            void *response /* UA_StatusCode */) {
+    struct setMonitoringContext *smc = (struct setMonitoringContext*)(uintptr_t)context;
+    const UA_UInt32 *monitoredItemId = (const UA_UInt32*)request;
+    UA_StatusCode *result = (UA_StatusCode*)response;
     UA_MonitoredItem *mon = UA_Subscription_getMonitoredItem(smc->sub, *monitoredItemId);
     if(!mon) {
         *result = UA_STATUSCODE_BADMONITOREDITEMIDINVALID;
@@ -919,8 +942,9 @@ Operation_SetMonitoringMode(UA_Server *server, UA_Session *session,
 
 UA_Boolean
 Service_SetMonitoringMode(UA_Server *server, UA_Session *session,
-                          const UA_SetMonitoringModeRequest *request,
-                          UA_SetMonitoringModeResponse *response) {
+                          const void *request_, void *response_) {
+    const UA_SetMonitoringModeRequest *request = (const UA_SetMonitoringModeRequest*)request_;
+    UA_SetMonitoringModeResponse *response = (UA_SetMonitoringModeResponse*)response_;
     UA_LOG_DEBUG_SESSION(server->config.logging, session, "Processing SetMonitoringMode");
     UA_LOCK_ASSERT(&server->serviceMutex);
 
@@ -948,7 +972,7 @@ Service_SetMonitoringMode(UA_Server *server, UA_Session *session,
 
     response->responseHeader.serviceResult =
         allocProcessServiceOperations(server, session,
-                                      (UA_ServiceOperation)Operation_SetMonitoringMode,
+                                      Operation_SetMonitoringMode,
                                       &smc, &request->monitoredItemIdsSize,
                                       &UA_TYPES[UA_TYPES_UINT32],
                                       &response->resultsSize,
@@ -958,23 +982,29 @@ Service_SetMonitoringMode(UA_Server *server, UA_Session *session,
 }
 
 static void
-Operation_DeleteMonitoredItem(UA_Server *server, UA_Session *session, UA_Subscription *sub,
-                              const UA_UInt32 *monitoredItemId, UA_StatusCode *result) {
+Operation_DeleteMonitoredItem(UA_Server *server, UA_Session *session,
+                              const void *context /* UA_Subscription */,
+                              const void *request /* UA_UInt32 */,
+                              void *response /* UA_StatusCode */) {
+    UA_Subscription *sub = (UA_Subscription*)(uintptr_t)context;
+    const UA_UInt32 *monitoredItemId = (const UA_UInt32*)request;
+    UA_StatusCode *result = (UA_StatusCode*)response;
     UA_LOCK_ASSERT(&server->serviceMutex);
+
     UA_MonitoredItem *mon = UA_Subscription_getMonitoredItem(sub, *monitoredItemId);
     if(!mon) {
         *result = UA_STATUSCODE_BADMONITOREDITEMIDINVALID;
         return;
     }
-    notifyMonitoredItem(server, mon,
-                        UA_APPLICATIONNOTIFICATIONTYPE_MONITOREDITEM_DELETE);
-    UA_MonitoredItem_delete(server, mon);
+
+    UA_MonitoredItem_delete(server, mon, true);
 }
 
 UA_Boolean
 Service_DeleteMonitoredItems(UA_Server *server, UA_Session *session,
-                             const UA_DeleteMonitoredItemsRequest *request,
-                             UA_DeleteMonitoredItemsResponse *response) {
+                             const void *request_, void *response_) {
+    const UA_DeleteMonitoredItemsRequest *request = (const UA_DeleteMonitoredItemsRequest*)request_;
+    UA_DeleteMonitoredItemsResponse *response = (UA_DeleteMonitoredItemsResponse*)response_;
     UA_LOG_DEBUG_SESSION(server->config.logging, session,
                          "Processing DeleteMonitoredItemsRequest");
     UA_LOCK_ASSERT(&server->serviceMutex);
@@ -997,7 +1027,7 @@ Service_DeleteMonitoredItems(UA_Server *server, UA_Session *session,
 
     response->responseHeader.serviceResult =
         allocProcessServiceOperations(server, session,
-                                      (UA_ServiceOperation)Operation_DeleteMonitoredItem,
+                                      Operation_DeleteMonitoredItem,
                                       sub, &request->monitoredItemIdsSize,
                                       &UA_TYPES[UA_TYPES_UINT32],
                                       &response->resultsSize,
@@ -1019,9 +1049,7 @@ UA_Server_deleteMonitoredItem(UA_Server *server, UA_UInt32 monitoredItemId) {
 
     UA_StatusCode res = UA_STATUSCODE_BADMONITOREDITEMIDINVALID;
     if(mon) {
-        notifyMonitoredItem(server, mon,
-                            UA_APPLICATIONNOTIFICATIONTYPE_MONITOREDITEM_DELETE);
-        UA_MonitoredItem_delete(server, mon);
+        UA_MonitoredItem_delete(server, mon, true);
         res = UA_STATUSCODE_GOOD;
     }
 

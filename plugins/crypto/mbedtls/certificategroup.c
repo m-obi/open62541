@@ -479,11 +479,6 @@ mbedtlsVerifyChain(UA_CertificateGroup *cg, MemoryCertStore *ctx, mbedtls_x509_c
     if(depth == UA_MBEDTLS_MAX_CHAIN_LENGTH)
         return UA_STATUSCODE_BADCERTIFICATECHAININCOMPLETE;
 
-    /* Verification Step: Validity Period */
-    if(mbedtls_x509_time_is_future(&cert->valid_from) ||
-       mbedtls_x509_time_is_past(&cert->valid_to))
-        return (depth == 0) ? UA_STATUSCODE_BADCERTIFICATETIMEINVALID :
-            UA_STATUSCODE_BADCERTIFICATEISSUERTIMEINVALID;
 
     /* Return the most specific error code. BADCERTIFICATECHAININCOMPLETE is
      * returned only if all possible chains are incomplete. */
@@ -550,9 +545,19 @@ mbedtlsVerifyChain(UA_CertificateGroup *cg, MemoryCertStore *ctx, mbedtls_x509_c
      * certificate "on the way down". Can we trust this certificate? */
     if(ret == UA_STATUSCODE_BADCERTIFICATEUNTRUSTED) {
         for(mbedtls_x509_crt *t = &ctx->trustedCertificates; t; t = t->next) {
-            if(mbedtlsSameBuf(&cert->tbs, &t->tbs))
-                return UA_STATUSCODE_GOOD;
+            if(mbedtlsSameBuf(&cert->tbs, &t->tbs)) {
+                ret = UA_STATUSCODE_GOOD;
+                break;
+            }
         }
+    }
+
+    if(ret == UA_STATUSCODE_GOOD) {
+        /* Verification Step: Validity Period */
+        if(mbedtls_x509_time_is_future(&cert->valid_from) ||
+        mbedtls_x509_time_is_past(&cert->valid_to))
+            return (depth == 0) ? UA_STATUSCODE_BADCERTIFICATETIMEINVALID :
+                UA_STATUSCODE_BADCERTIFICATEISSUERTIMEINVALID;
     }
 
     return ret;
@@ -1044,8 +1049,11 @@ UA_CertificateUtils_decryptPrivateKey(const UA_ByteString privateKey,
         return UA_STATUSCODE_BADINVALIDARGUMENT;
     }
 
-    /* Already in DER format -> return verbatim */
-    if(privateKey.length > 1 && privateKey.data[0] == 0x30 && privateKey.data[1] == 0x82)
+    /* Already in DER format -> return verbatim.
+     * DER-encoded keys start with ASN.1 SEQUENCE tag (0x30). PEM-encoded keys
+     * start with "-----BEGIN" (0x2D). Check only the tag byte to handle both
+     * short-form (< 128 bytes) and long-form length encodings. */
+    if(privateKey.length > 1 && privateKey.data[0] == 0x30)
         return UA_ByteString_copy(&privateKey, outDerKey);
 
     /* Create a null-terminated string */
@@ -1077,7 +1085,12 @@ UA_CertificateUtils_decryptPrivateKey(const UA_ByteString privateKey,
 
     /* Write the DER-encoded key into a local buffer */
     unsigned char buf[1 << 14];
-    size_t pos = (size_t)mbedtls_pk_write_key_der(&ctx, buf, sizeof(buf));
+    int written = mbedtls_pk_write_key_der(&ctx, buf, sizeof(buf));
+    if(written <= 0) {
+        mbedtls_pk_free(&ctx);
+        return UA_STATUSCODE_BADSECURITYCHECKSFAILED;
+    }
+    size_t pos = (size_t)written;
 
     /* Allocate memory */
     UA_StatusCode res = UA_ByteString_allocBuffer(outDerKey, pos);
@@ -1092,4 +1105,35 @@ UA_CertificateUtils_decryptPrivateKey(const UA_ByteString privateKey,
     return UA_STATUSCODE_GOOD;
 }
 
+UA_StatusCode
+UA_CertificateUtils_getCertCommonName(const UA_ByteString *certificate, UA_String *commonName) {
+    if(!certificate || !certificate->data || !commonName)
+        return UA_STATUSCODE_BADINTERNALERROR;
+
+    mbedtls_x509_crt publicKey;
+    mbedtls_x509_crt_init(&publicKey);
+
+    UA_StatusCode retval =
+        UA_mbedTLS_LoadCertificate((UA_ByteString*)(uintptr_t)certificate,
+                                   &publicKey);
+    if(retval != UA_STATUSCODE_GOOD)
+        return retval;
+
+    for(mbedtls_x509_name *name = &publicKey.subject;
+        name != NULL;
+        name = name->next) {
+        if(MBEDTLS_OID_CMP(MBEDTLS_OID_AT_CN, &name->oid) == 0) {
+            UA_String tmp = {
+                (size_t)name->val.len,
+                (UA_Byte*)name->val.p
+            };
+            retval = UA_String_copy(&tmp, commonName);
+
+            break;
+        }
+    }
+
+    mbedtls_x509_crt_free(&publicKey);
+    return retval;
+}
 #endif

@@ -87,7 +87,7 @@ set(test_plugin_sources
 
 # Network replay tests currently require a Linux environment.
 # Also only do it for 64bit builds, as there is a bug in the Debian multi-arch installation.
-if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux" AND NOT UA_FORCE_32BIT AND NOT UA_ARCHITECTURE_LWIP)
+if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux" AND NOT UA_FORCE_32BIT)
     list(APPEND test_plugin_sources
                 ${PROJECT_SOURCE_DIR}/tests/testing-plugins/testing_networklayers_pcap.c)
     list(APPEND LIBS pcap)
@@ -117,19 +117,46 @@ target_compile_definitions(open62541-testplugins PRIVATE -DUA_DYNAMIC_LINKING_EX
 # Unit Test Definition Macro
 # For now we need to disable the libc freeres. See https://github.com/open62541/open62541/pull/1003#issuecomment-315045143
 # This also requires to disable the phtread cache with no-nptl-pthread-stackcache
-set(VALGRIND_FLAGS --quiet --trace-children=yes --leak-check=full --run-libc-freeres=yes --sim-hints=no-nptl-pthread-stackcache --track-fds=yes)
+set(VALGRIND_FLAGS --trace-children=yes --leak-check=full --run-libc-freeres=yes --track-fds=yes)
+if(NOT MSVC AND UA_ENABLE_UNIT_TESTS_MEMCHECK)
+    execute_process(COMMAND valgrind --version OUTPUT_VARIABLE VALGRIND_VERSION_STRING OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(VALGRIND_VERSION_STRING MATCHES "valgrind-([0-9]+)\\.([0-9]+)")
+        set(VALGRIND_MAJOR ${CMAKE_MATCH_1})
+        set(VALGRIND_MINOR ${CMAKE_MATCH_2})
+        if(VALGRIND_MAJOR LESS 3 OR (VALGRIND_MAJOR EQUAL 3 AND VALGRIND_MINOR LESS 22))
+            list(APPEND VALGRIND_FLAGS --sim-hints=no-nptl-pthread-stackcache)
+        endif()
+        # Valgrind 3.26+ with --quiet produces empty log files when no errors are found,
+        # breaking the FD-leak check in valgrind_check_error.py. Use --quiet only for
+        # older versions where it still outputs the file descriptors summary.
+        if(VALGRIND_MAJOR LESS 3 OR (VALGRIND_MAJOR EQUAL 3 AND VALGRIND_MINOR LESS 26))
+            set(VALGRIND_FLAGS --quiet ${VALGRIND_FLAGS})
+        endif()
+    else()
+        set(VALGRIND_FLAGS --quiet ${VALGRIND_FLAGS})
+    endif()
+endif()
 macro(add_test_valgrind TEST_NAME)
     if(UA_ENABLE_UNIT_TESTS_MEMCHECK)
         if(MSVC)
-            add_test(${TEST_NAME} drmemory -batch -exit_code_if_errors 1 -results_to_stderr -summary -- ${ARGN})
+            set(TEST_COMMAND drmemory -batch -exit_code_if_errors 1
+                -results_to_stderr -summary -- ${ARGN})
         else()
             set(VALGRIND_LOG ${TESTS_BINARY_DIR}/${TEST_NAME}.log)
             set(VALGRIND_CMD valgrind --error-exitcode=1 --suppressions=${PROJECT_SOURCE_DIR}/tests/valgrind_suppressions.supp ${VALGRIND_FLAGS} --log-file=${VALGRIND_LOG} ${ARGN})
-            add_test(${TEST_NAME} ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/valgrind_check_error.py ${VALGRIND_LOG} ${VALGRIND_CMD})
+            set(TEST_COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/tests/valgrind_check_error.py
+                ${VALGRIND_LOG} ${VALGRIND_CMD})
         endif()
     else()
-        add_test(${TEST_NAME} ${ARGN})
+        set(TEST_COMMAND ${ARGN})
     endif()
+    if(UA_TEST_WRAPPER)
+        add_test(${TEST_NAME} ${UA_TEST_WRAPPER} ${TEST_LAUNCHER} ${TEST_COMMAND})
+    else()
+        add_test(${TEST_NAME} ${TEST_LAUNCHER} ${TEST_COMMAND})
+    endif()
+    unset(TEST_COMMAND)
     if(UA_BUILD_FUZZING_CORPUS)
         target_sources(check_${TEST_NAME} PRIVATE ${PROJECT_SOURCE_DIR}/tests/fuzz/ua_debug_dump_pkgs_file.c)
         file(MAKE_DIRECTORY ${PROJECT_BINARY_DIR}/corpus/${TEST_NAME})
@@ -167,17 +194,31 @@ function(ua_add_test test_path_relative)
     string(REPLACE "/" ";" QUALIFIED_PATHNAME ${PATH_WITHOUT_EXTENSION})
     list(POP_BACK QUALIFIED_PATHNAME TEST_NAME)
 
-    set(options)
+    set(options MQTT_BROKER)
     set(oneValueArgs)
-    set(multiValueArgs EXTRASOURCES EXTRALIBS)
+    set(multiValueArgs EXTRASOURCES EXTRALIBS WRAPPER)
     cmake_parse_arguments(arg "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
     add_executable(${TEST_NAME} ${test_path_relative} ${arg_EXTRASOURCES} $<TARGET_OBJECTS:open62541-object> $<TARGET_OBJECTS:open62541-plugins> $<TARGET_OBJECTS:open62541-testplugins>)
     add_dependencies(${TEST_NAME} open62541-testplugins)
     target_link_libraries(${TEST_NAME} ${LIBS} ${arg_EXTRALIBS})
+    if(MSVC)
+        target_compile_options(${TEST_NAME} PRIVATE /FI${PROJECT_SOURCE_DIR}/tests/testing-plugins/check_subtest_logging.h)
+    else()
+        target_compile_options(${TEST_NAME} PRIVATE -include ${PROJECT_SOURCE_DIR}/tests/testing-plugins/check_subtest_logging.h)
+    endif()
     target_compile_definitions(${TEST_NAME} PRIVATE -DUA_UNITTEST)
     set_target_properties(${TEST_NAME} PROPERTIES FOLDER "tests")
+    set(UA_TEST_WRAPPER ${arg_WRAPPER})
+    if(arg_MQTT_BROKER)
+        set(TEST_LAUNCHER ${Python3_EXECUTABLE}
+            ${PROJECT_SOURCE_DIR}/tests/mqtt_broker.py --)
+    else()
+        set(TEST_LAUNCHER)
+    endif()
     add_test_valgrind(${TEST_NAME} ${TESTS_BINARY_DIR}/${TEST_NAME})
+    unset(UA_TEST_WRAPPER)
+    unset(TEST_LAUNCHER)
 endfunction()
 
 ua_add_test(check_types_builtin.c)
@@ -191,6 +232,11 @@ ua_add_test(check_parse_num.c)
 ua_add_test(check_pcg_basic.c)
 ua_add_test(check_utf8.c)
 ua_add_test(check_musl_inet_pton.c)
+ua_add_test(check_config_default.c)
+
+if(UNIX AND NOT APPLE)
+    ua_add_test(check_log_syslog.c)
+endif()
 
 if(UA_ENABLE_JSON_ENCODING)
     ua_add_test(check_cj5.c)
@@ -199,7 +245,22 @@ if(UA_ENABLE_JSON_ENCODING)
     ua_add_test(check_types_json_decode.c)
 
     configure_file(${CMAKE_SOURCE_DIR}/tests/server/server_json_config.json5 ${CMAKE_BINARY_DIR}/tests/server_json_config.json5 COPYONLY)
-    ua_add_test(server/check_json_config.c)
+    ua_add_test(server/check_server_json_config.c)
+
+    configure_file(${CMAKE_SOURCE_DIR}/tests/client/client_json/client_json_config.json5 ${CMAKE_BINARY_DIR}/tests/client_json_config.json5 COPYONLY)
+    configure_file(${CMAKE_SOURCE_DIR}/tests/client/client_json/client_json_config_username.json5 ${CMAKE_BINARY_DIR}/tests/client_json_config_username.json5 COPYONLY)
+    configure_file(${CMAKE_SOURCE_DIR}/tests/client/client_json/client_json_config_certificate.json5 ${CMAKE_BINARY_DIR}/tests/client_json_config_certificate.json5 COPYONLY)
+    ua_add_test(client/check_client_json_config.c)
+
+    # Copy client and server certificates and keys for test
+    configure_file(${CMAKE_SOURCE_DIR}/tests/client/client_json/client_cert.der ${CMAKE_BINARY_DIR}/tests/client_cert.der COPYONLY)
+    configure_file(${CMAKE_SOURCE_DIR}/tests/client/client_json/client_key.der ${CMAKE_BINARY_DIR}/tests/client_key.der COPYONLY)
+    configure_file(${CMAKE_SOURCE_DIR}/tests/client/client_json/server_cert.der ${CMAKE_BINARY_DIR}/tests/server_cert.der COPYONLY)
+    configure_file(${CMAKE_SOURCE_DIR}/tests/client/client_json/server_key.der ${CMAKE_BINARY_DIR}/tests/server_key.der COPYONLY)
+
+    if(UA_ENABLE_ENCRYPTION)
+        ua_add_test(server/check_json_config_pki.c)
+    endif()
 
     if(UA_ENABLE_PUBSUB)
         ua_add_test(pubsub/check_pubsub_encoding_json.c)
@@ -234,16 +295,20 @@ ua_add_test(check_types_order_struct.c)
 ua_add_test(check_utils_trustlist_path.c)
 ua_add_test(check_types_copy_complex.c)
 ua_add_test(check_types_print.c)
+ua_add_test(check_types_definition.c)
 ua_add_test(check_encoding_roundtrip.c)
 ua_add_test(check_types_builtin_binary.c)
 ua_add_test(check_utils_url_kvm.c)
 ua_add_test(check_securechannel.c)
+ua_add_test(check_securechannel_unit.c)
 ua_add_test(check_timer.c)
 ua_add_test(check_eventloop.c)
 ua_add_test(check_eventloop_tcp.c)
 ua_add_test(check_eventloop_udp.c)
 
-if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux" AND NOT UA_ARCHITECTURE_LWIP)
+if((${CMAKE_SYSTEM_NAME} STREQUAL "Linux" OR
+     ${CMAKE_SYSTEM_NAME} STREQUAL "Darwin") AND
+   NOT UA_ARCHITECTURE_LWIP)
     ua_add_test(check_eventloop_interrupt.c)
 endif()
 
@@ -253,15 +318,31 @@ if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux" AND NOT UA_ARCHITECTURE_LWIP AND NOT UA
 endif()
 
 if(UA_ENABLE_MQTT)
-    ua_add_test(check_eventloop_mqtt.c)
+    ua_add_test(check_eventloop_mqtt.c MQTT_BROKER)
+endif()
+
+if(UA_ENABLE_LWS_MQTT)
+    ua_add_test(check_eventloop_mqtt_lws.c WRAPPER ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/tools/lws/mqttBroker.py --run-test)
+endif()
+
+if(UA_ENABLE_LWS)
+    ua_add_test(check_eventloop_http.c WRAPPER ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/tools/lws/httpServer.py --run-test)
+    ua_add_test(check_eventloop_websocket_lws.c)
 endif()
 
 # Test Server
+
+if(UA_ENABLE_JSON_ENCODING)
+    ua_add_test(server/check_server_config_json.c)
+endif()
 
 ua_add_test(server/check_accesscontrol.c)
 ua_add_test(server/check_services_view.c)
 ua_add_test(server/check_services_attributes.c)
 ua_add_test(server/check_services_nodemanagement.c)
+ua_add_test(server/check_discovery_coverage.c)
 ua_add_test(server/check_server_callbacks.c)
 
 if(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
@@ -284,14 +365,17 @@ endif()
 
 if(UA_ENABLE_METHODCALLS)
     ua_add_test(server/check_services_call.c)
+    ua_add_test(server/check_services_method_coverage.c)
 endif()
 
 if(UA_ENABLE_SUBSCRIPTIONS)
     ua_add_test(server/check_services_subscriptions.c)
+ua_add_test(server/check_subscription_publishqueue.c)
     ua_add_test(server/check_monitoreditem_filter.c)
     if(UA_ENABLE_SUBSCRIPTIONS_EVENTS)
         ua_add_test(server/check_subscription_events.c)
         ua_add_test(server/check_subscription_events_local.c)
+        ua_add_test(server/check_modelchange_network.c)
         ua_add_test(server/check_subscription_event_filter.c)
     endif()
 endif()
@@ -304,7 +388,11 @@ if(UA_ENABLE_HISTORIZING)
 endif()
 
 ua_add_test(server/check_session.c)
+ua_add_test(server/check_session_errorpaths.c)
 ua_add_test(server/check_server.c)
+ua_add_test(server/check_server_utils_coverage.c)
+ua_add_test(server/check_services_securechannel.c)
+ua_add_test(server/check_server_auditing.c)
 ua_add_test(server/check_server_jobs.c)
 ua_add_test(server/check_server_userspace.c)
 ua_add_test(server/check_node_inheritance.c)
@@ -312,6 +400,7 @@ ua_add_test(server/check_server_utils.c)
 ua_add_test(server/check_nodes.c)
 ua_add_test(server/check_server_diagnostics.c)
 ua_add_test(server/check_server_readwrite.c)
+ua_add_test(server/check_server_enum_datatypedefinition.c)
 ua_add_test(server/check_server_attr_wrappers.c)
 ua_add_test(server/check_services_nodemanagement_callbacks.c)
 ua_add_test(server/check_server_ns0_diagnostics.c)
@@ -322,17 +411,22 @@ ua_add_test(server/check_services_attributes_all.c)
 if(UA_ENABLE_RBAC)
     ua_add_test(server/check_server_rbac.c)
     ua_add_test(server/check_server_rbac_permissions.c)
+    ua_add_test(server/check_server_rbac_client.c)
+    ua_add_test(server/check_server_rbac_interlocked.c)
 endif()
 
 if(UA_ENABLE_SUBSCRIPTIONS)
     ua_add_test(server/check_services_subscriptions_modify.c)
     ua_add_test(server/check_local_monitored_item.c)
+ua_add_test(server/check_datachange_deadband_typekinds.c)
 endif()
 
 if(UA_ENABLE_PUBSUB)
     ua_add_test(pubsub/check_pubsub_encoding.c)
     ua_add_test(pubsub/check_pubsub_encoding_custom.c)
     ua_add_test(pubsub/check_pubsub_pds.c)
+    ua_add_test(pubsub/check_pubsub_state_machine.c)
+    ua_add_test(pubsub/check_pubsub_state_machine_extra.c)
     ua_add_test(pubsub/check_pubsub_connection_udp.c)
     ua_add_test(pubsub/check_pubsub_publish.c)
     ua_add_test(pubsub/check_pubsub_get_state.c)
@@ -344,7 +438,7 @@ if(UA_ENABLE_PUBSUB)
     ua_add_test(pubsub/check_pubsub_publishspeed.c)
 
     ua_add_test(pubsub/check_pubsub_offset.c)
-    if(UA_ARCHITECTURE_POSIX)
+    if(UA_ARCHITECTURE_POSIX AND NOT APPLE)
         ua_add_test(pubsub/check_pubsub_custom_state_machine.c)
     endif()
 
@@ -353,6 +447,7 @@ if(UA_ENABLE_PUBSUB)
         ua_add_test(pubsub/check_pubsub_encryption_aes256.c)
         ua_add_test(pubsub/check_pubsub_decryption.c)
         ua_add_test(pubsub/check_pubsub_subscribe_encrypted.c)
+        ua_add_test(encryption/check_pubsub_securitypolicy_crypto.c)
         if(UA_ENABLE_PUBSUB_SKS)
             ua_add_test(pubsub/check_pubsub_sks_keystorage.c)
             ua_add_test(pubsub/check_pubsub_sks_push.c)
@@ -377,8 +472,8 @@ if(UA_ENABLE_PUBSUB)
         ua_add_test(pubsub/check_pubsub_informationmodel_methods.c)
     endif()
     if(UA_ENABLE_MQTT)
-        ua_add_test(pubsub/check_pubsub_connection_mqtt.c)
-        ua_add_test(pubsub/check_pubsub_mqtt.c)
+        ua_add_test(pubsub/check_pubsub_connection_mqtt.c MQTT_BROKER)
+        ua_add_test(pubsub/check_pubsub_mqtt.c MQTT_BROKER)
     endif()
     if(UA_ENABLE_PUBSUB_FILE_CONFIG)
         ua_add_test(pubsub/check_pubsub_configuration.c)
@@ -392,7 +487,7 @@ if(UA_ENABLE_SUBSCRIPTIONS)
     ua_add_test(server/check_server_monitoringspeed.c)
 endif()
 
-if(UA_ENABLE_SUBSCRIPTIONS_ALARMS_CONDITIONS)
+if(UA_ENABLE_SUBSCRIPTIONS_EVENTS AND UA_NAMESPACE_ZERO STREQUAL "FULL")
     ua_add_test(server/check_server_alarmsconditions.c)
 endif()
 
@@ -405,6 +500,8 @@ ua_add_test(server/check_server_reverseconnect.c)
 # Test Client
 
 ua_add_test(client/check_client.c)
+ua_add_test(client/check_client_config_coverage.c)
+ua_add_test(client/check_client_lifecycle_coverage.c)
 ua_add_test(client/check_client_discovery.c)
 ua_add_test(client/check_activateSession.c)
 ua_add_test(client/check_activateSessionAsync.c)
@@ -429,10 +526,17 @@ endif()
 
 # Test Encryption and Authentication
 
+# Always-on coverage of the accept-all certificate group fallback (built into
+# every variant including the no-encryption build).
+ua_add_test(encryption/check_certificategroup_none.c)
+
 if(UA_ENABLE_ENCRYPTION)
     ua_add_test(client/check_client_encryption.c)
     ua_add_test(encryption/check_crl_validation.c)
+    ua_add_test(encryption/check_cert_validation_client_response.c)
     ua_add_test(encryption/check_ca_chain.c)
+    ua_add_test(encryption/check_crypto_coverage.c)
+    ua_add_test(server/check_server_getendpoints.c)
 
     if(UA_ENABLE_ENCRYPTION_OPENSSL OR UA_ENABLE_ENCRYPTION_MBEDTLS)
         ua_add_test(client/check_client_authentication.c)
@@ -444,8 +548,17 @@ if(UA_ENABLE_ENCRYPTION)
         ua_add_test(server/check_discovery.c)
     endif()
 
-    if(UA_ENABLE_GDS_PUSHMANAGEMENT)
+    if(UA_ENABLE_DRIVER_GDS_RECEIVER)
         ua_add_test(encryption/check_gds_informationmodel.c)
+    endif()
+endif()
+
+if(UA_ENABLE_DISCOVERY AND (UA_ENABLE_DISCOVERY_MULTICAST_MDNSD OR
+                            UA_ENABLE_DISCOVERY_MULTICAST_AVAHI))
+    ua_add_test(server/check_discovery_mdnsd.c)
+    if(NOT MSVC)
+        target_compile_options(check_discovery_mdnsd PRIVATE
+            -Wno-variadic-macros)
     endif()
 endif()
 
@@ -453,34 +566,64 @@ if(UA_ENABLE_ENCRYPTION_MBEDTLS)
     ua_add_test(encryption/check_encryption_basic128rsa15.c)
     ua_add_test(encryption/check_encryption_basic256.c)
     ua_add_test(encryption/check_encryption_basic256sha256.c)
+    ua_add_test(encryption/check_server_config_default.c)
+    ua_add_test(encryption/check_encryption_basic256sha256_with_config.c)
     ua_add_test(encryption/check_encryption_aes128sha256rsaoaep.c)
     ua_add_test(encryption/check_encryption_aes256sha256rsapss.c)
     ua_add_test(encryption/check_username_connect_none.c)
     ua_add_test(encryption/check_encryption_key_password.c)
     ua_add_test(encryption/check_cert_generation.c)
-    ua_add_test(encryption/check_csr_generation.c)
-    ua_add_test(encryption/check_update_certificate.c)
+    if(UA_ENABLE_DRIVER_GDS_RECEIVER)
+        ua_add_test(encryption/check_csr_generation.c)
+        ua_add_test(encryption/check_update_certificate.c)
+        ua_add_test(encryption/check_gds_receiver_lifecycle.c)
+    endif()
     ua_add_test(encryption/check_update_trustlist.c)
     ua_add_test(encryption/check_certificategroup.c)
+    ua_add_test(encryption/check_securitypolicy_crypto.c)
 endif()
 
 if(UA_ENABLE_ENCRYPTION_OPENSSL OR UA_ENABLE_ENCRYPTION_LIBRESSL)
     ua_add_test(encryption/check_encryption_basic128rsa15.c)
     ua_add_test(encryption/check_encryption_basic256.c)
     ua_add_test(encryption/check_encryption_basic256sha256.c)
+    ua_add_test(encryption/check_server_config_default.c)
+    ua_add_test(encryption/check_encryption_basic256sha256_with_config.c)
     ua_add_test(encryption/check_encryption_aes128sha256rsaoaep.c)
     ua_add_test(encryption/check_encryption_aes256sha256rsapss.c)
     ua_add_test(encryption/check_encryption_key_password.c)
     ua_add_test(encryption/check_cert_generation.c)
-    ua_add_test(encryption/check_csr_generation.c)
-    ua_add_test(encryption/check_update_certificate.c)
+    if(UA_ENABLE_DRIVER_GDS_RECEIVER)
+        ua_add_test(encryption/check_csr_generation.c)
+        ua_add_test(encryption/check_update_certificate.c)
+        ua_add_test(encryption/check_gds_receiver_lifecycle.c)
+    endif()
     ua_add_test(encryption/check_update_trustlist.c)
     ua_add_test(encryption/check_username_connect_none.c)
     ua_add_test(encryption/check_certificategroup.c)
+    ua_add_test(encryption/check_securitypolicy_crypto.c)
 endif()
 
-if(UA_ENABLE_ENCRYPTION_OPENSSL)
+if(UA_ENABLE_ENCRYPTION_OPENSSL OR
+   (UA_ENABLE_ENCRYPTION_MBEDTLS AND MBEDTLS_VERSION_MAJOR GREATER_EQUAL 3))
     ua_add_test(encryption/check_encryption_eccnistp256.c)
+endif()
+
+# The AEAD ECC policies (AesGcm / ChaChaPoly) are implemented only in the
+# OpenSSL backend, so their tests are OpenSSL-only.
+if(UA_ENABLE_ENCRYPTION_OPENSSL)
+    ua_add_test(encryption/check_encryption_eccnistp256_aesgcm.c)
+    ua_add_test(encryption/check_encryption_eccnistp256_chachapoly.c)
+endif()
+
+if(UA_ENABLE_ENCRYPTION_OPENSSL OR
+   (UA_ENABLE_ENCRYPTION_MBEDTLS AND MBEDTLS_VERSION_MAJOR GREATER_EQUAL 3))
+    ua_add_test(encryption/check_encryption_ecc.c)
+endif()
+
+if(UA_ENABLE_ENCRYPTION_OPENSSL OR
+   (UA_ENABLE_ENCRYPTION_MBEDTLS AND MBEDTLS_VERSION_MAJOR GREATER_EQUAL 3))
+    ua_add_test(encryption/check_ecc_config.c)
 endif()
 
 # Tests for Nodeset Compiler
@@ -498,6 +641,28 @@ if(UA_NAMESPACE_ZERO STREQUAL "FULL")
 endif()
 
 # Only do the network replay test for 64bit builds, as there is a bug in the Debian multi-arch installation
-if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux" AND NOT UA_ARCHITECTURE_LWIP AND NOT UA_FORCE_32BIT)
+if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux" AND NOT UA_FORCE_32BIT)
     ua_add_test(network_replay/check_network_replay.c)
+endif()
+
+# Cross-SDK interoperability test binaries (standalone, no check framework)
+if(UA_BUILD_INTEROP_TESTS)
+    if(NOT TARGET interop_server)
+        add_executable(interop_server interop/interop_server.c
+            $<TARGET_OBJECTS:open62541-object>
+            $<TARGET_OBJECTS:open62541-plugins>)
+        target_link_libraries(interop_server ${LIBS})
+        set_target_properties(interop_server PROPERTIES
+            FOLDER "tests"
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/tests")
+    endif()
+    if(NOT TARGET check_interop_client)
+        add_executable(check_interop_client interop/check_interop_client.c
+            $<TARGET_OBJECTS:open62541-object>
+            $<TARGET_OBJECTS:open62541-plugins>)
+        target_link_libraries(check_interop_client ${LIBS})
+        set_target_properties(check_interop_client PROPERTIES
+            FOLDER "tests"
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/tests")
+    endif()
 endif()
